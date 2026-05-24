@@ -12,7 +12,5 @@ namespace MeshSlicer
             Positive = positive;
             Negative = negative;
         }
-
-        public bool HasBoth => Positive != null && Negative != null;
     }
 }
