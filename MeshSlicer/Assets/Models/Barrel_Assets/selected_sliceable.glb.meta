@@ -1,5 +1,5 @@
 fileFormatVersion: 2
-guid: 4fcba5eccae8f4e40979dded6b2ca1a1
+guid: f02402105e09d482eadac866aba27789
 ScriptedImporter:
   internalIDToNameTable: []
   externalObjects: {}
@@ -23,6 +23,6 @@ ScriptedImporter:
     layer: 0
     skinUpdateWhenOffscreen: 1
     lightIntensityFactor: 1
-    sceneObjectCreation: 1
+    sceneObjectCreation: 2
   assetDependencies: []
   reportItems: []
