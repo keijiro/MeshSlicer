@@ -24,8 +24,9 @@ Before running: verify the Blender MCP server is reachable with a trivial call (
 3. **Voxel Remesh** — rebuild a watertight surface (drops UVs).
 4. **Decimate (COLLAPSE)** — reduce to a runtime-friendly face count while preserving topological closure.
 5. **Data Transfer** (loop UV, `POLYINTERP_NEAREST`) — project UVs back from the original.
-6. **Verify** — watertight + manifold + outward normals + no degenerate faces + slice-and-cap probe + UV present.
-7. Export `<source>_sliceable` as `.glb` next to the input so Unity re-imports it.
+6. **Shade smooth** — set `polygon.use_smooth = True` on every face; without this, glTF export bakes face normals per corner and Unity renders the result flat shaded.
+7. **Verify** — watertight + manifold + outward normals + no degenerate faces + slice-and-cap probe + UV present.
+8. Export `<source>_sliceable` as `.glb` next to the input so Unity re-imports it.
 
 Result object is named `<source>_sliceable`. Original stays hidden in the Blender scene.
 
@@ -124,7 +125,15 @@ m3.loop_mapping = 'POLYINTERP_NEAREST'
 bpy.ops.object.datalayout_transfer(modifier=m3.name)
 bpy.ops.object.modifier_apply(modifier=m3.name)
 
-# 5) Verify
+# 5) Force smooth shading on every polygon. The REMESH modifier's
+# `use_smooth_shade` only affects the live preview; after `modifier_apply`
+# (and the Decimate re-triangulation that follows), `polygon.use_smooth`
+# is False, so the glTF exporter writes face normals per corner and Unity
+# renders the result flat shaded with ~3 unshared vertices per triangle.
+for p in work.data.polygons:
+    p.use_smooth = True
+
+# 6) Verify
 me = work.data
 bm = bmesh.new(); bm.from_mesh(me); bm.normal_update()
 
