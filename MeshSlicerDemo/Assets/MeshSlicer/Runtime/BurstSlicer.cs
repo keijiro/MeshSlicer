@@ -52,44 +52,59 @@ public static class BurstSlicer
         var posCount = new NativeArray<int>(numTris, Allocator.TempJob);
         var negCount = new NativeArray<int>(numTris, Allocator.TempJob);
         var cutCount = new NativeArray<int>(numTris, Allocator.TempJob);
-
-        // Pass 1 (parallel): classify each triangle and count its output.
-        new CountJob
-        {
-            Verts = srcVerts, Indices = srcIndices, PlaneN = n, PlaneD = plane.Distance, Eps = eps,
-            PosCount = posCount, NegCount = negCount, CutCount = cutCount
-        }.Schedule(numTris, 128).Complete();
-
-        // Exclusive prefix sums give each triangle a disjoint output range.
         var posOff = new NativeArray<int>(numTris, Allocator.TempJob);
         var negOff = new NativeArray<int>(numTris, Allocator.TempJob);
         var cutOff = new NativeArray<int>(numTris, Allocator.TempJob);
         var totals = new NativeArray<int>(3, Allocator.TempJob);
-        new PrefixJob
-        {
-            PosCount = posCount, NegCount = negCount, CutCount = cutCount,
-            PosOff = posOff, NegOff = negOff, CutOff = cutOff, Totals = totals
-        }.Run();
-        int totalPos = totals[0], totalNeg = totals[1], totalCut = totals[2];
 
-        var posBody = new NativeArray<Vertex>(totalPos, Allocator.TempJob);
-        var negBody = new NativeArray<Vertex>(totalNeg, Allocator.TempJob);
-        var cutArr = new NativeArray<float3>(totalCut, Allocator.TempJob);
+        // Split the mesh, and if the cut boundary grazes vertices/edges (which would
+        // leave a hole in the cap), nudge the plane along its normal and retry. The
+        // cut segments are produced anyway, so a clean first attempt is free; only a
+        // degenerate one pays for re-running the (cheap) parallel passes.
+        var baseD = plane.Distance;
+        NativeArray<Vertex> posBody = default, negBody = default;
+        NativeArray<float3> cutArr = default;
+        CapBuilder cap = null;
 
-        // Pass 2 (parallel): write each triangle's split into its range.
-        new WriteJob
+        for (var ai = 0; ai < Slicer.NudgeSteps.Length; ai++)
         {
-            Verts = srcVerts, Indices = srcIndices, PlaneN = n, PlaneD = plane.Distance, Eps = eps,
-            PosOff = posOff, NegOff = negOff, CutOff = cutOff,
-            Pos = posBody, Neg = negBody, Cut = cutArr
-        }.Schedule(numTris, 128).Complete();
+            var d = baseD - Slicer.NudgeSteps[ai] * eps;
+
+            new CountJob
+            {
+                Verts = srcVerts, Indices = srcIndices, PlaneN = n, PlaneD = d, Eps = eps,
+                PosCount = posCount, NegCount = negCount, CutCount = cutCount
+            }.Schedule(numTris, 128).Complete();
+
+            new PrefixJob
+            {
+                PosCount = posCount, NegCount = negCount, CutCount = cutCount,
+                PosOff = posOff, NegOff = negOff, CutOff = cutOff, Totals = totals
+            }.Run();
+
+            posBody = new NativeArray<Vertex>(totals[0], Allocator.TempJob);
+            negBody = new NativeArray<Vertex>(totals[1], Allocator.TempJob);
+            cutArr = new NativeArray<float3>(totals[2], Allocator.TempJob);
+
+            new WriteJob
+            {
+                Verts = srcVerts, Indices = srcIndices, PlaneN = n, PlaneD = d, Eps = eps,
+                PosOff = posOff, NegOff = negOff, CutOff = cutOff,
+                Pos = posBody, Neg = negBody, Cut = cutArr
+            }.Schedule(numTris, 128).Complete();
+
+            cap = MakeCap(n, extent, cutArr);
+            if (cap.IsManifoldBoundary() || ai == Slicer.NudgeSteps.Length - 1) break;
+
+            posBody.Dispose(); negBody.Dispose(); cutArr.Dispose();
+        }
         JobMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
 
-        var posVerts = new NativeList<Vertex>(totalPos + 256, Allocator.TempJob);
-        var negVerts = new NativeList<Vertex>(totalNeg + 256, Allocator.TempJob);
+        var posVerts = new NativeList<Vertex>(posBody.Length + 256, Allocator.TempJob);
+        var negVerts = new NativeList<Vertex>(negBody.Length + 256, Allocator.TempJob);
         posVerts.AddRange(posBody);
         negVerts.AddRange(negBody);
-        AppendCaps(n, extent, cutArr, posVerts, negVerts);
+        AppendCapTris(cap, n, posVerts, negVerts);
         CapMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
 
         var hasPos = posVerts.Length >= 3;
@@ -146,13 +161,15 @@ public static class BurstSlicer
 
     // --- caps (managed, reuses the naive triangulator) ---
 
-    static void AppendCaps(float3 n, float extent, NativeArray<float3> cuts,
-                           NativeList<Vertex> pos, NativeList<Vertex> neg)
+    static CapBuilder MakeCap(float3 n, float extent, NativeArray<float3> cuts)
     {
-        if (cuts.Length < 2) return;
         var cap = new CapBuilder(n, extent);
         for (var i = 0; i + 1 < cuts.Length; i += 2) cap.AddSegment(cuts[i], cuts[i + 1]);
+        return cap;
+    }
 
+    static void AppendCapTris(CapBuilder cap, float3 n, NativeList<Vertex> pos, NativeList<Vertex> neg)
+    {
         var tris = cap.BuildCapTriangles(); // CCW in (u,v) -> normal +n
         if (tris.Count == 0) return;
         var pts = cap.Points;
