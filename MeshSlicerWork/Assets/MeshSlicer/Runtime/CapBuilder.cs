@@ -52,14 +52,37 @@ sealed class CapBuilder
 
     // Chains edges into loops and triangulates. Returns triangles as triples of
     // indices into Points. Winding is CCW in the (u,v) basis, i.e. normal == +n.
+    // Cheap degeneracy probe: the cut boundary closes into clean caps iff its graph
+    // is 2-regular (every welded point has exactly degree 2 -> a disjoint union of
+    // simple cycles). Any degree-1 (dangling) or degree>=3 (T-junction) point means
+    // the plane grazes vertices/edges and the cap would have a hole. O(#segments).
+    public bool IsManifoldBoundary()
+    {
+        if (_edges.Count == 0) return true; // plane misses the mesh: nothing to cap
+        var degree = new int[_points.Count];
+        foreach (var e in _edges) { degree[e.A]++; degree[e.B]++; }
+        foreach (var d in degree) if (d == 1 || d >= 3) return false;
+        return true;
+    }
+
     public List<int> BuildCapTriangles()
     {
         var loops = ChainLoops();
         if (loops.Count == 0) return new List<int>();
 
+        // Project onto the plane basis, then normalize to a unit box. The triangulator
+        // uses a fixed epsilon for its orientation tests; normalizing makes that
+        // epsilon effectively relative, so tiny meshes (e.g. cm-scale imported assets)
+        // triangulate as robustly as unit-scale procedural ones.
         var pts2D = new float2[_points.Count];
         for (var i = 0; i < _points.Count; i++)
             pts2D[i] = new float2(math.dot(_points[i], _u), math.dot(_points[i], _v));
+
+        var min = new float2(float.MaxValue);
+        var max = new float2(float.MinValue);
+        for (var i = 0; i < _points.Count; i++) { min = math.min(min, pts2D[i]); max = math.max(max, pts2D[i]); }
+        var scale = 1f / math.max(math.cmax(max - min), 1e-20f);
+        for (var i = 0; i < _points.Count; i++) pts2D[i] = (pts2D[i] - min) * scale;
 
         var tris = new List<int>();
         PolygonTriangulator.Triangulate(loops, pts2D, tris);

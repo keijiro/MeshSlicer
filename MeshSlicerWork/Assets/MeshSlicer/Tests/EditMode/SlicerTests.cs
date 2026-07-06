@@ -266,6 +266,48 @@ public sealed class SlicerTests
         }
     }
 
+    // Regression: an imported (tiny, detailed) asset must produce watertight pieces
+    // across many plane positions/orientations — including cuts that graze vertices
+    // (degeneracy -> nudge) and the tiny-scale triangulation case that once left a
+    // small hole. Runs for both the naive and Burst implementations.
+    [Test] public void CrateFbx_ManyPlanes_Watertight_Naive() => AssertCrateAlwaysWatertight(Slicer.Slice);
+    [Test] public void CrateFbx_ManyPlanes_Watertight_Burst() => AssertCrateAlwaysWatertight(BurstSlicer.Slice);
+
+    static void AssertCrateAlwaysWatertight(System.Func<Mesh, Plane, SliceResult> slice)
+    {
+        var mesh = LoadFbxMesh("Assets/Models/Crate.fbx");
+        Assert.IsNotNull(mesh, "Crate.fbx mesh not found");
+        if (!MeshInspect.IsWatertight(mesh, out _, out _)) Assert.Ignore("source crate is not watertight");
+
+        var ext = math.cmax((float3)mesh.bounds.size);
+        var center = (float3)mesh.bounds.center;
+
+        var planes = new System.Collections.Generic.List<Plane>();
+        var rng = new System.Random(12345);
+        for (var i = 0; i < 40; i++)
+        {
+            var dir = new float3((float)(rng.NextDouble() * 2 - 1), (float)(rng.NextDouble() * 2 - 1), (float)(rng.NextDouble() * 2 - 1));
+            if (math.length(dir) < 1e-3f) continue;
+            var n = math.normalize(dir);
+            var off = (float)(rng.NextDouble() * 0.6 - 0.3);
+            planes.Add(new Plane(n, center + n * (off * ext)));
+        }
+        // The exact orientation/offset that used to leave a hole.
+        var nBad = math.normalize(new float3(-0.259f, 0.341f, 0.904f));
+        planes.Add(new Plane(nBad, center + nBad * (0.07f * ext)));
+
+        foreach (var plane in planes)
+        {
+            var r = slice(mesh, plane);
+            if (r.Positive != null)
+                Assert.IsTrue(MeshInspect.IsWatertight(r.Positive, out var pb, out var pn),
+                    $"positive not watertight (boundary={pb}, nonmanifold={pn}) normal={plane.Normal}");
+            if (r.Negative != null)
+                Assert.IsTrue(MeshInspect.IsWatertight(r.Negative, out var nb, out var nn),
+                    $"negative not watertight (boundary={nb}, nonmanifold={nn}) normal={plane.Normal}");
+        }
+    }
+
     static Mesh LoadFbxMesh(string path)
     {
         foreach (var obj in AssetDatabase.LoadAllAssetsAtPath(path))

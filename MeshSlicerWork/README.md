@@ -41,6 +41,23 @@ position / normal / tangent / uv0.
 - **Samples/**
   - `SliceDemo` — visual verification scene.
   - `SliceBenchmark` — performance measurement scene.
+  - `InteractiveSlicer` — interactive edit-time slicing tool (see below).
+
+## Interactive scene
+
+`Assets/MeshSlicer/Samples/InteractiveSlicer.unity` lets you slice the Crate by
+dragging a plane in the Editor — no play mode required. The scene contains:
+
+- **Crate** — holds the source mesh and the `InteractiveSlicer` component.
+- **CuttingPlane** — a translucent quad whose Transform *is* the cutting plane
+  (position = a point on the plane, local up = the plane normal).
+
+Move or rotate **CuttingPlane** in the Scene view and the two halves are rebuilt
+live and drawn pulled slightly apart along the cut normal. Each rebuild destroys
+the previous halves and their meshes first, so nothing accumulates (verified: the
+live mesh count is stable across repeated edits). The tool is `[ExecuteAlways]`
+and driven by `EditorApplication.update`, so it also works while the Editor is
+unfocused.
 
 ## Tests (Unity Test Runner, EditMode — 18 passing)
 
@@ -82,6 +99,28 @@ triangulation (managed) → upload. The remaining largest phase is cap generatio
 (managed); porting the cap chaining and triangulation to Burst would be the next
 optimization lever.
 
+## Robustness on imperfect / real-world meshes
+
+Cutting an imported asset (tiny, highly detailed) can leave a small hole in the
+cap at specific plane positions. Two independent causes are handled:
+
+1. **Degenerate cut boundary** — when the plane grazes vertices/edges, the cut
+   segments fail to weld into clean closed loops (dangling or T-junction points).
+   This is detected cheaply by `CapBuilder.IsManifoldBoundary()` (the boundary
+   graph is 2-regular ⟺ a set of disjoint simple cycles; `O(#segments)`), and the
+   plane is nudged along its normal by a small, escalating amount until the cut is
+   clean. The probe reuses the cut-segment pass, so a clean first attempt is nearly
+   free and only a degenerate one pays for a retry.
+2. **Triangulator scale sensitivity** — the ear-clipping orientation tests use a
+   fixed epsilon. For a centimetre-scale asset the projected coordinates are so
+   small that the tests misfire. `CapBuilder` now normalizes the projected 2D cap
+   points to a unit box before triangulating, making the epsilon effectively
+   relative.
+
+Regression tests `CrateFbx_ManyPlanes_Watertight_{Naive,Burst}` slice the imported
+crate across many orientations/offsets (including the previously-failing case) and
+assert both pieces stay watertight.
+
 ## Development time
 
 The full implementation — writing the tests first, the naive slicer, the visual
@@ -90,4 +129,9 @@ iterations — took **49 minutes 41 seconds** of active work in a single agent
 session. This was an autonomous run driven by an AI coding agent (Claude Code),
 including the edit → recompile → run-tests → measure loop against a live Unity
 Editor.
+
+That 49m 41s figure covers only the initial implementation session. Subsequent
+work done in later sessions — the interactive editing scene and the cap-hole
+robustness fixes (degeneracy detection + plane nudging, and scale-invariant
+triangulation) described above — is **not** included in that measurement.
 
