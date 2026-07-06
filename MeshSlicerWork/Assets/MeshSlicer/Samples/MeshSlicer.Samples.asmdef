@@ -1,0 +1,12 @@
+{
+    "name": "MeshSlicer.Samples",
+    "rootNamespace": "MeshSlicer.Samples",
+    "references": [
+        "MeshSlicer.Runtime",
+        "Unity.Mathematics"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "autoReferenced": true
+}

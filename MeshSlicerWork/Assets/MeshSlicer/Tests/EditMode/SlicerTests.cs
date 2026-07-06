@@ -1,6 +1,6 @@
-using System;
 using NUnit.Framework;
 using Unity.Mathematics;
+using UnityEditor;
 using UnityEngine;
 using Plane = Unity.Mathematics.Geometry.Plane;
 
@@ -8,278 +8,272 @@ namespace MeshSlicer.Tests {
 
 public sealed class SlicerTests
 {
-    const float Eps = 1e-3f;
+    // --- source generator sanity: every primitive must be watertight ---
 
-    static Plane PlaneThrough(float3 normal, float3 point) =>
-        new Plane(math.normalize(normal), point);
-
-    static void DestroyMesh(Mesh m)
+    static Mesh[] AllPrimitives() => new[]
     {
-        if (m != null) UnityEngine.Object.DestroyImmediate(m);
-    }
-
-    // ---- Argument handling ----------------------------------------------
+        ProceduralMeshes.Cube(),
+        ProceduralMeshes.Tetrahedron(),
+        ProceduralMeshes.IcoSphere(2),
+        ProceduralMeshes.Torus(),
+        ProceduralMeshes.Pipe(),
+        ProceduralMeshes.Tray(),
+        ProceduralMeshes.Bowl()
+    };
 
     [Test]
-    public void Slice_NullSource_Throws()
+    public void SourcePrimitivesAreWatertight()
     {
-        Assert.Throws<ArgumentNullException>(
-            () => Slicer.Slice(null, new Plane(new float3(0, 1, 0), 0f)));
+        foreach (var m in AllPrimitives())
+        {
+            Assert.IsTrue(MeshInspect.IsWatertight(m, out var b, out var nm),
+                $"{m.name} not watertight (boundary={b}, nonmanifold={nm})");
+            Assert.Greater(MeshInspect.SignedVolume(m), 0, $"{m.name} has non-positive volume (bad winding)");
+        }
     }
 
-    // ---- No intersection cases ------------------------------------------
+    // --- generic slice invariants applied to every convex + concave primitive ---
+
+    static System.Func<Mesh, Plane, SliceResult> _slice = Slicer.Slice;
+
+    [SetUp] public void ResetImpl() => _slice = Slicer.Slice;
+
+    static void AssertSliceInvariants(Mesh src, Plane plane, bool expectBothSides = true)
+    {
+        var extent = math.cmax((float3)src.bounds.size);
+        var tol = math.max(extent * 2e-3f, 1e-5f);
+
+        var r = _slice(src, plane);
+
+        if (expectBothSides)
+        {
+            Assert.IsNotNull(r.Positive, $"{src.name}: positive piece missing");
+            Assert.IsNotNull(r.Negative, $"{src.name}: negative piece missing");
+        }
+
+        // Watertightness of each produced piece.
+        if (r.Positive != null)
+            Assert.IsTrue(MeshInspect.IsWatertight(r.Positive, out var pb, out var pn),
+                $"{src.name} positive not watertight (boundary={pb}, nonmanifold={pn})");
+        if (r.Negative != null)
+            Assert.IsTrue(MeshInspect.IsWatertight(r.Negative, out var nb, out var nn),
+                $"{src.name} negative not watertight (boundary={nb}, nonmanifold={nn})");
+
+        // Volume conservation.
+        var vSrc = MeshInspect.SignedVolume(src);
+        var vPos = r.Positive != null ? MeshInspect.SignedVolume(r.Positive) : 0;
+        var vNeg = r.Negative != null ? MeshInspect.SignedVolume(r.Negative) : 0;
+        Assert.AreEqual(vSrc, vPos + vNeg, math.max(vSrc * 0.01, 1e-4),
+            $"{src.name}: volume not conserved (src={vSrc:F5}, pos+neg={vPos + vNeg:F5})");
+
+        // Side classification: no vertex should stray across the plane.
+        if (r.Positive != null)
+        {
+            MeshInspect.SignedDistanceRange(r.Positive, plane, out var min, out _);
+            Assert.GreaterOrEqual(min, -tol, $"{src.name}: positive piece has vertices on the negative side");
+        }
+        if (r.Negative != null)
+        {
+            MeshInspect.SignedDistanceRange(r.Negative, plane, out _, out var max);
+            Assert.LessOrEqual(max, tol, $"{src.name}: negative piece has vertices on the positive side");
+        }
+
+        // Caps face outward (positive piece cap faces -n, negative faces +n) and use zero UVs.
+        if (r.Positive != null)
+        {
+            var area = MeshInspect.CapArea(r.Positive, plane, out var nzUv, out var sdot);
+            Assert.Greater(area, 0, $"{src.name}: positive piece has no cap");
+            Assert.Less(sdot, 0, $"{src.name}: positive cap faces the wrong way");
+            Assert.IsFalse(nzUv, $"{src.name}: positive cap UVs are not (0,0)");
+        }
+        if (r.Negative != null)
+        {
+            var area = MeshInspect.CapArea(r.Negative, plane, out var nzUv, out var sdot);
+            Assert.Greater(area, 0, $"{src.name}: negative piece has no cap");
+            Assert.Greater(sdot, 0, $"{src.name}: negative cap faces the wrong way");
+            Assert.IsFalse(nzUv, $"{src.name}: negative cap UVs are not (0,0)");
+        }
+    }
 
     [Test]
-    public void Slice_PlaneAbove_ReturnsWholeOnNegativeSide()
-    {
-        var cube = TestMeshFactory.CreateCube();
-        // Plane well above the cube: entire cube is on the negative side.
-        var plane = PlaneThrough(new float3(0, 1, 0), new float3(0, 5, 0));
-        var r = Slicer.Slice(cube, plane);
+    public void Cube_DiagonalPlane()
+        => AssertSliceInvariants(ProceduralMeshes.Cube(), PlaneFrom(new float3(0.3f, 0, 0), math.normalize(new float3(1, 0.5f, 0.2f))));
 
-        Assert.IsNull(r.Positive, "nothing should be on the positive side");
+    [Test]
+    public void Cube_AxisAlignedPlane()
+        => AssertSliceInvariants(ProceduralMeshes.Cube(), PlaneFrom(float3.zero, new float3(0, 1, 0)));
+
+    [Test]
+    public void Tetrahedron_Plane()
+        => AssertSliceInvariants(ProceduralMeshes.Tetrahedron(), PlaneFrom(new float3(0, 0.05f, 0), math.normalize(new float3(0.2f, 1, 0.1f))));
+
+    [Test]
+    public void IcoSphere_Plane()
+        => AssertSliceInvariants(ProceduralMeshes.IcoSphere(3), PlaneFrom(new float3(0.05f, 0, 0), math.normalize(new float3(0.3f, 1, 0.4f))));
+
+    // --- nested / multi-loop cross sections ---
+
+    [Test]
+    public void Torus_EquatorialCut_ProducesAnnulusCap()
+    {
+        var src = ProceduralMeshes.Torus(0.6f, 0.22f);
+        var plane = PlaneFrom(float3.zero, new float3(0, 1, 0));
+        AssertSliceInvariants(src, plane);
+        AssertAnnulusCap(src, plane, math.PI * 4 * 0.6f * 0.22f);
+    }
+
+    [Test]
+    public void Pipe_PerpendicularCut_ProducesAnnulusCap()
+    {
+        var src = ProceduralMeshes.Pipe(0.5f, 0.3f, 1f);
+        var plane = PlaneFrom(float3.zero, new float3(0, 1, 0));
+        AssertSliceInvariants(src, plane);
+        AssertAnnulusCap(src, plane, math.PI * (0.5f * 0.5f - 0.3f * 0.3f));
+    }
+
+    [Test]
+    public void Tray_HorizontalCut_ProducesFrameCap()
+    {
+        var src = ProceduralMeshes.Tray(1f, 1f, 0.7f, 0.18f);
+        var plane = PlaneFrom(float3.zero, new float3(0, 1, 0));
+        AssertSliceInvariants(src, plane);
+        var frame = 1f * 1f - (1f - 0.36f) * (1f - 0.36f);
+        AssertAnnulusCap(src, plane, frame);
+    }
+
+    [Test]
+    public void Bowl_HorizontalCut_ProducesAnnulusCap()
+    {
+        var src = ProceduralMeshes.Bowl(0.5f, 0.08f);
+        var plane = PlaneFrom(new float3(0, -0.2f, 0), new float3(0, 1, 0));
+        AssertSliceInvariants(src, plane);
+        AssertAnnulusCap(src, plane, math.PI * (0.5f * 0.5f - 0.42f * 0.42f));
+    }
+
+    static void AssertAnnulusCap(Mesh src, Plane plane, float expectedArea)
+    {
+        var r = _slice(src, plane);
+        var posArea = MeshInspect.CapArea(r.Positive, plane, out _, out _);
+        var negArea = MeshInspect.CapArea(r.Negative, plane, out _, out _);
+        Assert.AreEqual(expectedArea, negArea, expectedArea * 0.03,
+            $"{src.name}: cap area {negArea:F4} != expected annulus {expectedArea:F4} (hole not handled?)");
+        Assert.AreEqual(posArea, negArea, expectedArea * 0.01,
+            $"{src.name}: positive and negative cap areas differ");
+    }
+
+    // --- one-sided plane leaves the mesh intact ---
+
+    [Test]
+    public void PlaneOutsideMesh_LeavesOnePiece()
+    {
+        var src = ProceduralMeshes.Cube(1f);
+        var r = Slicer.Slice(src, PlaneFrom(new float3(0, 5, 0), new float3(0, 1, 0)));
+        Assert.IsNull(r.Positive);
         Assert.IsNotNull(r.Negative);
-        Assert.AreEqual(cube.triangles.Length, r.Negative.triangles.Length,
-            "whole mesh should pass through unchanged");
-
-        DestroyMesh(cube);
-        DestroyMesh(r.Negative);
+        Assert.AreEqual(MeshInspect.SignedVolume(src), MeshInspect.SignedVolume(r.Negative), 1e-4);
     }
 
-    [Test]
-    public void Slice_PlaneBelow_ReturnsWholeOnPositiveSide()
-    {
-        var cube = TestMeshFactory.CreateCube();
-        var plane = PlaneThrough(new float3(0, 1, 0), new float3(0, -5, 0));
-        var r = Slicer.Slice(cube, plane);
-
-        Assert.IsNotNull(r.Positive);
-        Assert.IsNull(r.Negative);
-        Assert.AreEqual(cube.triangles.Length, r.Positive.triangles.Length);
-
-        DestroyMesh(cube);
-        DestroyMesh(r.Positive);
-    }
-
-    // ---- Basic slicing ---------------------------------------------------
+    // --- imported FBX asset ---
 
     [Test]
-    public void Slice_CubeThroughCenter_ProducesTwoHalves()
+    public void CrateFbx_Slices()
     {
-        var cube = TestMeshFactory.CreateCube();
-        var plane = PlaneThrough(new float3(0, 1, 0), float3.zero);
-        var r = Slicer.Slice(cube, plane);
+        var mesh = LoadFbxMesh("Assets/Models/Crate.fbx");
+        Assert.IsNotNull(mesh, "Crate.fbx mesh not found");
+
+        var plane = PlaneFrom((float3)mesh.bounds.center, math.normalize(new float3(0.4f, 1, 0.2f)));
+        var r = Slicer.Slice(mesh, plane);
 
         Assert.IsNotNull(r.Positive);
         Assert.IsNotNull(r.Negative);
         Assert.Greater(r.Positive.triangles.Length, 0);
         Assert.Greater(r.Negative.triangles.Length, 0);
 
-        DestroyMesh(cube);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
-    }
+        var extent = math.cmax((float3)mesh.bounds.size);
+        var tol = extent * 3e-3f;
+        MeshInspect.SignedDistanceRange(r.Positive, plane, out var pmin, out _);
+        MeshInspect.SignedDistanceRange(r.Negative, plane, out _, out var nmax);
+        Assert.GreaterOrEqual(pmin, -tol, "Crate positive piece strays to negative side");
+        Assert.LessOrEqual(nmax, tol, "Crate negative piece strays to positive side");
 
-    // ---- Watertightness of results --------------------------------------
-
-    [TestCase(0f, 1f, 0f)]
-    [TestCase(1f, 0f, 0f)]
-    [TestCase(1f, 1f, 1f)]
-    [TestCase(0.3f, 1f, -0.6f)]
-    public void Slice_Cube_HalvesAreClosedManifolds(float nx, float ny, float nz)
-    {
-        var cube = TestMeshFactory.CreateCube();
-        var plane = PlaneThrough(new float3(nx, ny, nz), float3.zero);
-        var r = Slicer.Slice(cube, plane);
-
-        Assert.IsTrue(MeshAnalysis.IsClosedManifold(r.Positive, out var rp),
-            "positive half not watertight: " + rp);
-        Assert.IsTrue(MeshAnalysis.IsClosedManifold(r.Negative, out var rn),
-            "negative half not watertight: " + rn);
-
-        DestroyMesh(cube);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
-    }
-
-    [Test]
-    public void Slice_Sphere_HalvesAreClosedManifolds()
-    {
-        var sphere = TestMeshFactory.CreateSphere();
-        var plane = PlaneThrough(new float3(0.2f, 1f, 0.1f), new float3(0, 0.15f, 0));
-        var r = Slicer.Slice(sphere, plane);
-
-        Assert.IsTrue(MeshAnalysis.IsClosedManifold(r.Positive, out var rp),
-            "positive half not watertight: " + rp);
-        Assert.IsTrue(MeshAnalysis.IsClosedManifold(r.Negative, out var rn),
-            "negative half not watertight: " + rn);
-
-        DestroyMesh(sphere);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
-    }
-
-    // ---- Volume conservation (caps + walls correctness) -----------------
-
-    [Test]
-    public void Slice_Cube_VolumeIsConserved()
-    {
-        var cube = TestMeshFactory.CreateCube(2f);
-        var original = MeshAnalysis.SignedVolume(cube);
-        var plane = PlaneThrough(new float3(0.4f, 1f, 0.2f), new float3(0.1f, 0.2f, 0));
-        var r = Slicer.Slice(cube, plane);
-
-        var sum = MeshAnalysis.SignedVolume(r.Positive) + MeshAnalysis.SignedVolume(r.Negative);
-        Assert.AreEqual(original, sum, 1e-3, "sum of half volumes must equal original");
-        Assert.Greater(MeshAnalysis.SignedVolume(r.Positive), 0, "positive half must have outward winding");
-        Assert.Greater(MeshAnalysis.SignedVolume(r.Negative), 0, "negative half must have outward winding");
-
-        DestroyMesh(cube);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
-    }
-
-    [Test]
-    public void Slice_Sphere_VolumeIsConserved()
-    {
-        var sphere = TestMeshFactory.CreateSphere(1.5f);
-        var original = MeshAnalysis.SignedVolume(sphere);
-        var plane = PlaneThrough(new float3(0.3f, 1f, -0.2f), new float3(0, 0.2f, 0.1f));
-        var r = Slicer.Slice(sphere, plane);
-
-        var sum = MeshAnalysis.SignedVolume(r.Positive) + MeshAnalysis.SignedVolume(r.Negative);
-        Assert.AreEqual(original, sum, 1e-2, "sum of half volumes must equal original");
-
-        DestroyMesh(sphere);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
-    }
-
-    // ---- Side classification --------------------------------------------
-
-    [Test]
-    public void Slice_AllVerticesOnCorrectSide()
-    {
-        var cube = TestMeshFactory.CreateCube();
-        var plane = PlaneThrough(new float3(0.5f, 1f, 0.3f), new float3(0.05f, 0.1f, 0));
-        var r = Slicer.Slice(cube, plane);
-
-        foreach (var v in r.Positive.vertices)
-            Assert.GreaterOrEqual(plane.SignedDistanceToPoint(v), -Eps,
-                "positive vertex on wrong side");
-        foreach (var v in r.Negative.vertices)
-            Assert.LessOrEqual(plane.SignedDistanceToPoint(v), Eps,
-                "negative vertex on wrong side");
-
-        DestroyMesh(cube);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
-    }
-
-    // ---- Cap attributes --------------------------------------------------
-
-    [Test]
-    public void Slice_CapNormalsFacePlane_AndUVsAreZero()
-    {
-        var cube = TestMeshFactory.CreateCube();
-        var normal = math.normalize(new float3(0.2f, 1f, 0.1f));
-        var plane = new Plane(normal, 0f);
-        var r = Slicer.Slice(cube, plane);
-
-        AssertCap(r.Positive, plane, -normal);
-        AssertCap(r.Negative, plane, normal);
-
-        DestroyMesh(cube);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
-    }
-
-    // Verifies cap vertices (those lying on the plane whose normal points along
-    // the expected cap direction) have uv0 == (0,0), and that at least one such
-    // vertex exists.
-    static void AssertCap(Mesh mesh, Plane plane, float3 expectedNormal)
-    {
-        var verts = mesh.vertices;
-        var norms = mesh.normals;
-        var uvs = mesh.uv;
-        var found = 0;
-        for (var i = 0; i < verts.Length; i++)
+        // Only assert conservation when the imported asset is actually watertight.
+        if (MeshInspect.IsWatertight(mesh, out _, out _))
         {
-            var onPlane = math.abs(plane.SignedDistanceToPoint(verts[i])) < 1e-3f;
-            var alongCap = math.dot((float3)norms[i], expectedNormal) > 0.99f;
-            if (onPlane && alongCap)
-            {
-                found++;
-                Assert.AreEqual(0f, uvs[i].x, 1e-4f, "cap uv.x must be 0");
-                Assert.AreEqual(0f, uvs[i].y, 1e-4f, "cap uv.y must be 0");
-            }
+            var v = MeshInspect.SignedVolume(mesh);
+            Assert.AreEqual(v, MeshInspect.SignedVolume(r.Positive) + MeshInspect.SignedVolume(r.Negative),
+                math.max(math.abs(v) * 0.02, 1e-4), "Crate volume not conserved");
         }
-        Assert.Greater(found, 0, "no cap vertices found");
     }
 
-    // ---- Attribute integrity --------------------------------------------
+    // --- Burst implementation: same invariants + parity with the naive slicer ---
+
+    [Test] public void Burst_Cube()      { _slice = BurstSlicer.Slice; AssertSliceInvariants(ProceduralMeshes.Cube(), PlaneFrom(new float3(0.3f, 0, 0), math.normalize(new float3(1, 0.5f, 0.2f)))); }
+    [Test] public void Burst_IcoSphere() { _slice = BurstSlicer.Slice; AssertSliceInvariants(ProceduralMeshes.IcoSphere(3), PlaneFrom(new float3(0.05f, 0, 0), math.normalize(new float3(0.3f, 1, 0.4f)))); }
+
+    [Test] public void Burst_Torus_Annulus()
+    {
+        _slice = BurstSlicer.Slice;
+        var src = ProceduralMeshes.Torus(0.6f, 0.22f);
+        var plane = PlaneFrom(float3.zero, new float3(0, 1, 0));
+        AssertSliceInvariants(src, plane);
+        AssertAnnulusCap(src, plane, math.PI * 4 * 0.6f * 0.22f);
+    }
+
+    [Test] public void Burst_Pipe_Annulus()
+    {
+        _slice = BurstSlicer.Slice;
+        var src = ProceduralMeshes.Pipe(0.5f, 0.3f, 1f);
+        var plane = PlaneFrom(float3.zero, new float3(0, 1, 0));
+        AssertSliceInvariants(src, plane);
+        AssertAnnulusCap(src, plane, math.PI * (0.5f * 0.5f - 0.3f * 0.3f));
+    }
+
+    [Test] public void Burst_Tray_Frame()
+    {
+        _slice = BurstSlicer.Slice;
+        var src = ProceduralMeshes.Tray(1f, 1f, 0.7f, 0.18f);
+        var plane = PlaneFrom(float3.zero, new float3(0, 1, 0));
+        AssertSliceInvariants(src, plane);
+        AssertAnnulusCap(src, plane, 1f * 1f - (1f - 0.36f) * (1f - 0.36f));
+    }
+
+    [Test] public void Burst_Bowl_Annulus()
+    {
+        _slice = BurstSlicer.Slice;
+        var src = ProceduralMeshes.Bowl(0.5f, 0.08f);
+        var plane = PlaneFrom(new float3(0, -0.2f, 0), new float3(0, 1, 0));
+        AssertSliceInvariants(src, plane);
+        AssertAnnulusCap(src, plane, math.PI * (0.5f * 0.5f - 0.42f * 0.42f));
+    }
 
     [Test]
-    public void Slice_NormalsAndTangentsAreUnitLength()
+    public void Burst_MatchesNaive_Volumes()
     {
-        var sphere = TestMeshFactory.CreateSphere();
-        var plane = PlaneThrough(new float3(0.1f, 1f, 0.2f), float3.zero);
-        var r = Slicer.Slice(sphere, plane);
-
-        foreach (var mesh in new[] { r.Positive, r.Negative })
+        var shapes = new[]
         {
-            foreach (var n in mesh.normals)
-                Assert.AreEqual(1f, math.length((float3)n), 1e-2f,
-                    "normal must be unit length");
-            foreach (var t in mesh.tangents)
-                Assert.AreEqual(1f, math.length(((float4)(Vector4)t).xyz), 1e-2f,
-                    "tangent xyz must be unit length");
-        }
-
-        DestroyMesh(sphere);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
-    }
-
-    [Test]
-    public void Slice_PreservesAttributeChannels()
-    {
-        var cube = TestMeshFactory.CreateCube();
-        var plane = PlaneThrough(new float3(0, 1, 0), float3.zero);
-        var r = Slicer.Slice(cube, plane);
-
-        foreach (var mesh in new[] { r.Positive, r.Negative })
+            ProceduralMeshes.Cube(), ProceduralMeshes.IcoSphere(3),
+            ProceduralMeshes.Torus(), ProceduralMeshes.Pipe(),
+            ProceduralMeshes.Tray(), ProceduralMeshes.Bowl()
+        };
+        var plane = PlaneFrom(new float3(0, -0.05f, 0), math.normalize(new float3(0.2f, 1, 0.15f)));
+        foreach (var s in shapes)
         {
-            Assert.AreEqual(mesh.vertexCount, mesh.normals.Length, "normals present");
-            Assert.AreEqual(mesh.vertexCount, mesh.tangents.Length, "tangents present");
-            Assert.AreEqual(mesh.vertexCount, mesh.uv.Length, "uv0 present");
+            var a = Slicer.Slice(s, plane);
+            var b = BurstSlicer.Slice(s, plane);
+            var va = a.Positive != null ? MeshInspect.SignedVolume(a.Positive) : 0;
+            var vb = b.Positive != null ? MeshInspect.SignedVolume(b.Positive) : 0;
+            Assert.AreEqual(va, vb, math.max(math.abs(va) * 0.01, 1e-4), $"{s.name}: Burst/naive positive volume mismatch");
         }
-
-        DestroyMesh(cube);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
     }
 
-    // ---- Interpolation correctness on a straddling edge ------------------
-
-    [Test]
-    public void Slice_IntersectionVertices_LieOnPlane()
+    static Mesh LoadFbxMesh(string path)
     {
-        var cube = TestMeshFactory.CreateCube();
-        var plane = PlaneThrough(new float3(0, 1, 0), float3.zero);
-        var r = Slicer.Slice(cube, plane);
-
-        // Every new intersection vertex introduced by the cut must sit on the
-        // plane. Cap and wall boundary vertices both qualify.
-        var onPlaneCount = 0;
-        foreach (var v in r.Positive.vertices)
-            if (math.abs(plane.SignedDistanceToPoint(v)) < 1e-3f) onPlaneCount++;
-        Assert.Greater(onPlaneCount, 0, "expected vertices exactly on the cut plane");
-
-        DestroyMesh(cube);
-        DestroyMesh(r.Positive);
-        DestroyMesh(r.Negative);
+        foreach (var obj in AssetDatabase.LoadAllAssetsAtPath(path))
+            if (obj is Mesh m) return m;
+        return null;
     }
+
+    static Plane PlaneFrom(float3 point, float3 normal) => new Plane(math.normalize(normal), point);
 }
 
 } // namespace MeshSlicer.Tests

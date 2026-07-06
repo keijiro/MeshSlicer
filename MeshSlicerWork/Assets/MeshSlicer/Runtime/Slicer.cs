@@ -1,4 +1,3 @@
-using System;
 using System.Collections.Generic;
 using Unity.Mathematics;
 using UnityEngine;
@@ -6,277 +5,173 @@ using Plane = Unity.Mathematics.Geometry.Plane;
 
 namespace MeshSlicer {
 
-// Naive, correctness-first mesh slicer. Cuts a 2-manifold / watertight mesh
-// with an arbitrary plane and returns the two resulting capped meshes.
+// Naive, correctness-first plane slicer. Given a watertight (2-manifold) mesh and a
+// plane (in the mesh's local space), returns the two pieces on either side of the
+// plane, each closed with a cap on the cut cross section. No performance tuning.
 public static class Slicer
 {
-    const float PositionWeldGrid = 1e-5f;
-
-    // A vertex staged during triangle clipping.
-    struct PolyVert
-    {
-        public bool IsCut;
-        public int Src;       // source vertex index (whole/original vertices)
-        public long Edge;     // source-edge key (wall intersection vertices)
-        public int Boundary;  // cut-boundary id, or -1 if not on the plane
-        public float3 Pos, Nrm;
-        public float4 Tan;
-        public float2 Uv;
-    }
-
-    // Cuts the source mesh with the given plane. The cross section of each half
-    // is closed with a flat cap. Vertex attributes carried over: position,
-    // normal, tangent and uv0. Cap uv0 is fixed to (0, 0).
     public static SliceResult Slice(Mesh source, Plane plane)
     {
-        if (source == null) throw new ArgumentNullException(nameof(source));
+        var verts = ReadVertices(source);
+        var indices = ReadIndices(source);
 
-        // --- Read source geometry -----------------------------------------
-        var srcPos = source.vertices;
-        var srcNrm = source.normals;
-        var srcTan = source.tangents;
-        var srcUv = source.uv;
-        var tris = source.triangles;
-        var vc = srcPos.Length;
-
-        var hasN = srcNrm.Length == vc;
-        var hasT = srcTan.Length == vc;
-        var hasU = srcUv.Length == vc;
-
-        float3 Pos(int i) => srcPos[i];
-        float3 Nrm(int i) => hasN ? (float3)srcNrm[i] : new float3(0, 1, 0);
-        float4 Tan(int i) => hasT ? (float4)(Vector4)srcTan[i] : new float4(1, 0, 0, 1);
-        float2 Uv(int i) => hasU ? (float2)srcUv[i] : float2.zero;
-
-        // Snap vertices lying within a small tolerance of the plane onto it.
-        // This removes near-degenerate slivers (and the tiny cap loops they
-        // spawn) that appear when the plane nearly grazes a source vertex.
-        var eps = math.length((float3)source.bounds.size) * 1e-4f;
-        var dist = new float[vc];
-        for (var i = 0; i < vc; i++)
-        {
-            var d = plane.SignedDistanceToPoint(srcPos[i]);
-            dist[i] = math.abs(d) < eps ? 0f : d;
-        }
-
-        var pos = new MeshBuildBuffer();
-        var neg = new MeshBuildBuffer();
-
-        // Cut boundary points welded by position, and the directed cap edges
-        // for each half (derived from the on-plane edge of each wall polygon).
-        var boundaryMap = new Dictionary<int3, int>();
-        var boundaryPos = new List<float3>();
-        var posCapEdges = new List<int2>();
-        var negCapEdges = new List<int2>();
-
-        int GetBoundary(float3 p)
-        {
-            var key = (int3)math.round(p / PositionWeldGrid);
-            if (boundaryMap.TryGetValue(key, out var id)) return id;
-            id = boundaryPos.Count;
-            boundaryMap[key] = id;
-            boundaryPos.Add(p);
-            return id;
-        }
-
-        var posPoly = new List<PolyVert>(4);
-        var negPoly = new List<PolyVert>(4);
-
-        // --- Classify & split every triangle ------------------------------
-        for (var t = 0; t < tris.Length; t += 3)
-        {
-            int i0 = tris[t], i1 = tris[t + 1], i2 = tris[t + 2];
-            float d0 = dist[i0], d1 = dist[i1], d2 = dist[i2];
-            var p0 = d0 >= 0; var p1 = d1 >= 0; var p2 = d2 >= 0;
-
-            if (p0 && p1 && p2) { EmitWhole(pos); continue; }
-            if (!p0 && !p1 && !p2) { EmitWhole(neg); continue; }
-
-            posPoly.Clear();
-            negPoly.Clear();
-            ClipEdge(i0, i1, d0, d1);
-            ClipEdge(i1, i2, d1, d2);
-            ClipEdge(i2, i0, d2, d0);
-
-            FanEmit(pos, posPoly);
-            FanEmit(neg, negPoly);
-            ExtractCapEdge(posPoly, posCapEdges);
-            ExtractCapEdge(negPoly, negCapEdges);
-
-            void ClipEdge(int a, int b, float da, float db)
-            {
-                if (da > 0) posPoly.Add(Original(a, false));
-                else if (da < 0) negPoly.Add(Original(a, false));
-                else { var v = Original(a, true); posPoly.Add(v); negPoly.Add(v); }
-
-                if (da * db >= 0) return; // no strict crossing
-
-                var s = da / (da - db);
-                var ip = Interpolate(a, b, s);
-                posPoly.Add(ip);
-                negPoly.Add(ip);
-            }
-
-            void EmitWhole(MeshBuildBuffer buf)
-            {
-                var a = buf.AddOriginal(i0, Pos(i0), Nrm(i0), Tan(i0), Uv(i0));
-                var b = buf.AddOriginal(i1, Pos(i1), Nrm(i1), Tan(i1), Uv(i1));
-                var c = buf.AddOriginal(i2, Pos(i2), Nrm(i2), Tan(i2), Uv(i2));
-                buf.AddTriangle(a, b, c);
-            }
-        }
-
-        // --- Build the caps ------------------------------------------------
         var n = math.normalize(plane.Normal);
-        var refv = math.abs(n.x) < 0.9f ? new float3(1, 0, 0) : new float3(0, 1, 0);
-        var u = math.normalize(math.cross(refv, n));
-        var w = math.cross(n, u); // (u, w, n) right-handed: cross(u, w) == n
-        BuildCap(pos, posCapEdges, boundaryPos, u, w, n);
-        BuildCap(neg, negCapEdges, boundaryPos, u, w, n);
+        var extent = math.cmax(source.bounds.size);
+        var eps = math.max(extent * 1e-4f, 1e-6f);
 
-        var posMesh = pos.ToMesh(source.name + "_Positive");
-        var negMesh = neg.ToMesh(source.name + "_Negative");
-        return new SliceResult(posMesh, negMesh);
+        var pos = new MeshBuilder();
+        var neg = new MeshBuilder();
+        var cap = new CapBuilder(n, extent);
 
-        // Local helpers that close over the source accessors ----------------
-
-        PolyVert Original(int i, bool onPlane) => new PolyVert
+        // Signed distances, snapped to the plane when within eps.
+        var dist = new float[verts.Length];
+        for (var i = 0; i < verts.Length; i++)
         {
-            IsCut = false, Src = i, Boundary = onPlane ? GetBoundary(Pos(i)) : -1,
-            Pos = Pos(i), Nrm = Nrm(i), Tan = Tan(i), Uv = Uv(i)
+            var d = plane.SignedDistanceToPoint(verts[i].Position);
+            dist[i] = math.abs(d) <= eps ? 0f : d;
+        }
+
+        var scratch = new List<Vertex>(4);
+        for (var t = 0; t < indices.Length; t += 3)
+        {
+            int ia = indices[t], ib = indices[t + 1], ic = indices[t + 2];
+            SliceTriangle(verts[ia], verts[ib], verts[ic], dist[ia], dist[ib], dist[ic],
+                          pos, neg, cap, scratch);
+        }
+
+        BuildCaps(cap, n, pos, neg);
+
+        return new SliceResult
+        {
+            Positive = pos.TriangleCount > 0 ? pos.ToMesh(source.name + "_Positive") : null,
+            Negative = neg.TriangleCount > 0 ? neg.ToMesh(source.name + "_Negative") : null
+        };
+    }
+
+    static void SliceTriangle(in Vertex a, in Vertex b, in Vertex c,
+                              float da, float db, float dc,
+                              MeshBuilder pos, MeshBuilder neg, CapBuilder cap,
+                              List<Vertex> scratch)
+    {
+        var strictPos = da > 0 || db > 0 || dc > 0;
+        var strictNeg = da < 0 || db < 0 || dc < 0;
+
+        // Collect the (at most two) points where the triangle boundary meets the plane.
+        Vertex cut0 = default, cut1 = default;
+        var cutCount = 0;
+        void AddCut(in Vertex v) { if (cutCount == 0) cut0 = v; else if (cutCount == 1) cut1 = v; cutCount++; }
+
+        if (da == 0) AddCut(a);
+        if (db == 0) AddCut(b);
+        if (dc == 0) AddCut(c);
+        if ((da > 0 && db < 0) || (da < 0 && db > 0)) AddCut(Vertex.Lerp(a, b, da / (da - db)));
+        if ((db > 0 && dc < 0) || (db < 0 && dc > 0)) AddCut(Vertex.Lerp(b, c, db / (db - dc)));
+        if ((dc > 0 && da < 0) || (dc < 0 && da > 0)) AddCut(Vertex.Lerp(c, a, dc / (dc - da)));
+
+        if (cutCount == 2) cap.AddSegment(cut0.Position, cut1.Position);
+
+        if (strictPos && strictNeg)
+        {
+            ClipHalf(a, b, c, da, db, dc, true, scratch);
+            EmitFan(pos, scratch);
+            ClipHalf(a, b, c, da, db, dc, false, scratch);
+            EmitFan(neg, scratch);
+        }
+        else if (strictPos)
+        {
+            pos.AddTriangle(a, b, c);
+        }
+        else if (strictNeg)
+        {
+            neg.AddTriangle(a, b, c);
+        }
+        // else: fully coplanar (all d == 0) -> skip degenerate face.
+    }
+
+    // Sutherland-Hodgman clip of the triangle to one half-space (on-plane kept).
+    static void ClipHalf(in Vertex a, in Vertex b, in Vertex c,
+                         float da, float db, float dc, bool keepPositive, List<Vertex> outPoly)
+    {
+        outPoly.Clear();
+        ClipEdge(a, b, da, db, keepPositive, outPoly);
+        ClipEdge(b, c, db, dc, keepPositive, outPoly);
+        ClipEdge(c, a, dc, da, keepPositive, outPoly);
+    }
+
+    static void ClipEdge(in Vertex cur, in Vertex nxt, float dc, float dn, bool keepPositive, List<Vertex> outPoly)
+    {
+        var curIn = keepPositive ? dc >= 0 : dc <= 0;
+        if (curIn) outPoly.Add(cur);
+        if ((dc > 0 && dn < 0) || (dc < 0 && dn > 0))
+        {
+            var s = dc / (dc - dn);
+            outPoly.Add(Vertex.Lerp(cur, nxt, s));
+        }
+    }
+
+    static void EmitFan(MeshBuilder builder, List<Vertex> poly)
+    {
+        for (var i = 1; i + 1 < poly.Count; i++)
+            builder.AddTriangle(poly[0], poly[i], poly[i + 1]);
+    }
+
+    static void BuildCaps(CapBuilder cap, float3 n, MeshBuilder pos, MeshBuilder neg)
+    {
+        var tris = cap.BuildCapTriangles(); // CCW in (u,v) -> normal +n
+        if (tris.Count == 0) return;
+        var pts = cap.Points;
+
+        var uAxis = math.abs(n.x) < 0.9f ? math.cross(n, new float3(1, 0, 0)) : math.cross(n, new float3(0, 1, 0));
+        var tangent = new float4(math.normalize(uAxis), 1);
+
+        Vertex Make(int i, float3 normal) => new Vertex
+        {
+            Position = pts[i], Normal = normal, Tangent = tangent, UV = float2.zero
         };
 
-        PolyVert Interpolate(int a, int b, float s)
+        for (var i = 0; i < tris.Count; i += 3)
         {
-            var tan = math.lerp(Tan(a), Tan(b), s);
-            var txyz = math.normalizesafe(tan.xyz, new float3(1, 0, 0));
-            var p = math.lerp(Pos(a), Pos(b), s);
-            return new PolyVert
+            int i0 = tris[i], i1 = tris[i + 1], i2 = tris[i + 2];
+            // Positive piece: cap faces -n, so reverse the +n winding.
+            pos.AddTriangle(Make(i0, -n), Make(i2, -n), Make(i1, -n));
+            // Negative piece: cap faces +n, keep winding.
+            neg.AddTriangle(Make(i0, n), Make(i1, n), Make(i2, n));
+        }
+    }
+
+    // --- mesh reading ---
+
+    static Vertex[] ReadVertices(Mesh mesh)
+    {
+        var count = mesh.vertexCount;
+        var p = mesh.vertices;
+        var nrm = mesh.normals;
+        var tan = mesh.tangents;
+        var uv = mesh.uv;
+        var hasN = nrm != null && nrm.Length == count;
+        var hasT = tan != null && tan.Length == count;
+        var hasUV = uv != null && uv.Length == count;
+
+        var verts = new Vertex[count];
+        for (var i = 0; i < count; i++)
+        {
+            verts[i] = new Vertex
             {
-                IsCut = true, Edge = EdgeKey(a, b), Boundary = GetBoundary(p),
-                Pos = p,
-                Nrm = math.normalizesafe(math.lerp(Nrm(a), Nrm(b), s), new float3(0, 1, 0)),
-                Tan = new float4(txyz, Tan(a).w),
-                Uv = math.lerp(Uv(a), Uv(b), s)
+                Position = p[i],
+                Normal = hasN ? (float3)(Vector3)nrm[i] : new float3(0, 1, 0),
+                Tangent = hasT ? (float4)(Vector4)tan[i] : new float4(1, 0, 0, 1),
+                UV = hasUV ? (float2)uv[i] : float2.zero
             };
         }
+        return verts;
     }
 
-    static void FanEmit(MeshBuildBuffer buf, List<PolyVert> poly)
+    static int[] ReadIndices(Mesh mesh)
     {
-        if (poly.Count < 3) return;
-        var i0 = Resolve(buf, poly[0]);
-        for (var k = 1; k < poly.Count - 1; k++)
-        {
-            var i1 = Resolve(buf, poly[k]);
-            var i2 = Resolve(buf, poly[k + 1]);
-            buf.AddTriangle(i0, i1, i2);
-        }
-    }
-
-    // Records the directed on-plane edge(s) of a wall polygon. The half's cap
-    // must traverse these edges in reverse, so the recorded direction already
-    // is the reversed (cap-consistent) one.
-    static void ExtractCapEdge(List<PolyVert> poly, List<int2> capEdges)
-    {
-        var m = poly.Count;
-        if (m < 3) return;
-        for (var i = 0; i < m; i++)
-        {
-            var c = poly[i];
-            var d = poly[(i + 1) % m];
-            if (c.Boundary >= 0 && d.Boundary >= 0 && c.Boundary != d.Boundary)
-                capEdges.Add(new int2(d.Boundary, c.Boundary)); // reversed: cap opposes wall
-        }
-    }
-
-    static int Resolve(MeshBuildBuffer buf, in PolyVert v) =>
-        v.IsCut
-            ? buf.AddWall(v.Edge, v.Pos, v.Nrm, v.Tan, v.Uv)
-            : buf.AddOriginal(v.Src, v.Pos, v.Nrm, v.Tan, v.Uv);
-
-    static long EdgeKey(int a, int b)
-    {
-        int lo = math.min(a, b), hi = math.max(a, b);
-        return ((long)lo << 32) | (uint)hi;
-    }
-
-    // Assembles directed cap edges into loops and triangulates each, preserving
-    // the loop orientation so cap winding stays consistent with the walls.
-    static void BuildCap(MeshBuildBuffer buf, List<int2> capEdges,
-                         List<float3> boundaryPos, float3 u, float3 w, float3 n)
-    {
-        if (capEdges.Count == 0) return;
-
-        var outgoing = new Dictionary<int, List<int>>();
-        foreach (var e in capEdges)
-        {
-            if (!outgoing.TryGetValue(e.x, out var l)) { l = new List<int>(2); outgoing[e.x] = l; }
-            l.Add(e.y);
-        }
-
-        var capTan = new float4(u, 1f);
-        var loop = new List<int>();
-        var pts = new List<float2>();
-        var localTris = new List<int>();
-        var starts = new List<int>(outgoing.Keys);
-
-        foreach (var start in starts)
-        {
-            while (outgoing.TryGetValue(start, out var sl) && sl.Count > 0)
-            {
-                // Walk a directed cycle back to `start`.
-                loop.Clear();
-                var cur = start;
-                while (outgoing.TryGetValue(cur, out var cl) && cl.Count > 0)
-                {
-                    var nxt = cl[cl.Count - 1];
-                    cl.RemoveAt(cl.Count - 1);
-                    loop.Add(cur);
-                    cur = nxt;
-                    if (cur == start) break;
-                }
-                if (loop.Count < 3) continue;
-
-                pts.Clear();
-                for (var i = 0; i < loop.Count; i++)
-                {
-                    var p = boundaryPos[loop[i]];
-                    pts.Add(new float2(math.dot(p, u), math.dot(p, w)));
-                }
-
-                localTris.Clear();
-                EarClipping.Triangulate(pts, localTris); // CCW output (+n)
-                var loopCcw = SignedArea(pts) > 0f;
-                var capNrm = loopCcw ? n : -n;
-
-                for (var i = 0; i < localTris.Count; i += 3)
-                {
-                    int ka = loop[localTris[i]];
-                    int kb = loop[localTris[i + 1]];
-                    int kc = loop[localTris[i + 2]];
-                    var la = buf.AddCap(ka, boundaryPos[ka], capNrm, capTan, float2.zero);
-                    var lb = buf.AddCap(kb, boundaryPos[kb], capNrm, capTan, float2.zero);
-                    var lc = buf.AddCap(kc, boundaryPos[kc], capNrm, capTan, float2.zero);
-                    // EarClipping is CCW; keep it when the loop is CCW, flip it
-                    // to the loop's winding otherwise.
-                    if (loopCcw) buf.AddTriangle(la, lb, lc);
-                    else buf.AddTriangle(la, lc, lb);
-                }
-            }
-        }
-    }
-
-    static float SignedArea(List<float2> pts)
-    {
-        var a = 0f;
-        for (int i = 0, m = pts.Count; i < m; i++)
-        {
-            var p = pts[i];
-            var q = pts[(i + 1) % m];
-            a += p.x * q.y - q.x * p.y;
-        }
-        return a * 0.5f;
+        if (mesh.subMeshCount == 1) return mesh.triangles;
+        var all = new List<int>();
+        for (var s = 0; s < mesh.subMeshCount; s++) all.AddRange(mesh.GetTriangles(s));
+        return all.ToArray();
     }
 }
 

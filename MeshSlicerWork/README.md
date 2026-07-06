@@ -1,43 +1,93 @@
-# MeshSlicer — Implementation Summary
+# Mesh Slicer
 
-A plane-based mesh cutting feature for Unity, built end-to-end from `Prompt.md` following a TDD workflow, from a naive correct implementation through Burst/Jobs optimization.
+Cuts a mesh with an arbitrary plane in Unity, producing the two resulting meshes.
+Each cut cross section is closed with a cap. Built test-first (TDD) and optimized
+with the Burst compiler and the C# Job System.
 
-## Phase 0–1: Setup & TDD (tests first)
-- Added `com.unity.mathematics / burst / collections / test-framework`; created a three-assembly layout (Runtime / Tests / Demo).
-- Wrote **comprehensive EditMode tests before any implementation** (`Assets/MeshSlicer/Tests/EditMode/`): watertightness (directed-edge consistency + 2-manifold), **volume conservation** (divergence theorem), cap normals = ±plane normal, cap uv0 = (0,0), vertex side classification, interpolated-attribute unit length, attribute-channel preservation, boundary-vertex on-plane check, argument validation. Test meshes: a cube and a degeneracy-free icosphere.
+The source mesh is assumed to satisfy the 2-manifold / watertight condition.
+Vertex data supported: position, normal, tangent, uv0. Cap uv0 is fixed to (0, 0).
 
-## Phase 2: Naive implementation (correctness first)
-Implemented `Slicer.Slice(Mesh, Plane)`: clip each triangle edge-by-edge to build the walls, weld boundary points by position to assemble cap loops, and triangulate via ear clipping. Non-obvious points discovered during debugging:
-- **Cap winding is derived from each wall polygon's on-plane edge direction** (a forced-CCW normal can be inconsistent with the walls). Positive and negative caps are triangulated independently.
-- **Boundary points are welded by quantized position** so face-split meshes (e.g. Unity's cube) still form closed cap loops.
-- **Vertices near the plane are snapped onto it** to eliminate near-degenerate slivers when the plane grazes a vertex.
+## API
 
-## Phase 3: Visual verification
-Placed a cube, sphere, and cylinder in a Built-in RP scene and rendered from two angles (above and below). Confirmed via AI vision that **both the positive and negative caps close correctly** — no holes, normals correct.
+```csharp
+using MeshSlicer;
+using Plane = Unity.Mathematics.Geometry.Plane;
 
-## Phase 4: Performance measurement (baseline)
-- **Method-level:** 1,280 → 81,920 triangles = 0.88 → 37.8 ms (~0.46 µs/tri).
-- **System-level** (per-frame slice + render, 20,480-tri source): slice ≈ 10.2 ms, frame ≈ 10.8 ms.
+// Naive, correctness-first implementation.
+SliceResult r = Slicer.Slice(mesh, plane);
 
-## Phase 5: Optimization (Burst / Job System / NativeArray / Advanced Mesh API)
-Implemented `BurstSlicer`: reads input via `MeshData`, cuts inside a `[BurstCompile] IJob` using `NativeList`/`NativeHashMap`, and writes output with `SetVertexBufferData`/`SetIndexBufferData` (minimizing array copies). Added parity tests against the naive version (including triangle-count equality).
+// Optimized implementation (Burst + Job System).
+SliceResult r = BurstSlicer.Slice(mesh, plane);
 
-| | Naive | Burst | Speedup |
+// Non-allocating overload for per-frame reuse.
+BurstSlicer.Slice(mesh, plane, positiveMesh, negativeMesh);
+```
+
+`Slice` returns `SliceResult { Mesh Positive; Mesh Negative; }`, where `Positive`
+is the piece on the side the plane normal points to (signed distance >= 0). Either
+side is `null` when the mesh lies entirely on one side of the plane. Both pieces
+share identical cap geometry, so the result stays watertight. Attributes carried:
+position / normal / tangent / uv0.
+
+## Project layout (`Assets/MeshSlicer/`)
+
+- **Runtime/**
+  - `Slicer` — naive, correctness-first implementation.
+  - `BurstSlicer` — optimized implementation.
+  - `CapBuilder` / `PolygonTriangulator` — cross-section triangulation with holes.
+  - `ProceduralMeshes` — watertight test-shape generators.
+  - `Vertex` / `MeshBuilder` / `SliceResult` — support types.
+- **Tests/EditMode/** — 18 EditMode tests (all passing).
+- **Samples/**
+  - `SliceDemo` — visual verification scene.
+  - `SliceBenchmark` — performance measurement scene.
+
+## Tests (Unity Test Runner, EditMode — 18 passing)
+
+- Watertightness (every edge shared by exactly two triangles after welding by
+  position), volume conservation, side classification, cap normal orientation,
+  cap uv0 = (0, 0).
+- Convex shapes (cube / tetrahedron / icosphere), plus **multi-loop / nested
+  (holed) cross sections**: torus (annulus), hollow pipe (annulus), open box /
+  tray (rectangular frame), bowl (annulus). The cap area is asserted against the
+  expected annulus area, so a wrongly filled hole fails the test.
+- The bundled `Crate.fbx`, a one-sided plane, and naive vs. Burst parity.
+
+## Visual verification
+
+Seven shapes are sliced and their two halves rendered pulled apart along the cut
+normal (Built-in Render Pipeline, Standard shader), then captured from the Game
+View. The annular caps close correctly: the pipe's round hole, the tray's
+rectangular frame, the torus donut, and the bowl shell are all preserved.
+
+## Performance (20,480-triangle icosphere, Editor)
+
+| Metric | Naive | Burst | Speedup |
 |---|---|---|---|
-| Method-level, 20,480 tri | 10.6 ms | 1.17 ms | **~9x** |
-| System-level, slice | 10.2 ms | 1.18 ms | ~8.6x |
-| System-level, frame | 10.8 ms | 1.65 ms | ~6.5x (≈600 FPS) |
+| Method-level slice | 9.16 ms | **1.04 ms** | 8.8x |
+| System-level (slice + render every frame) | 9.49 ms/frame | **1.54 ms/frame (~650 fps)** | 6.2x |
 
-A second iteration added a mesh-reuse overload for per-frame use (reduces allocation churn). Measurement showed the job itself dominates and wall-clock stayed flat — judged as **reaching a reasonable result**, so optimization was concluded. The Burst output was confirmed visually identical to the naive output.
+### Optimization iterations
 
-## Known limitations (next steps)
-- Cap triangulation **does not support nested loops (holes / torus-style annulus cross sections)** — ear clipping is per-loop only.
-- The Burst version is a single `IJob` (SIMD only, not multi-threaded). Converting triangle classification to `IJobParallelFor` is the remaining optimization lever.
+1. Burst `IJob` + `NativeArray` + Advanced Mesh API — 2.82 ms.
+2. O(n²) linked-list ear clipping (replacing the O(n³) naive rescan) — 1.21 ms.
+   This was the largest single win.
+3. Parallel two-pass triangle classification (`IJobParallelFor` + prefix sum) —
+   1.04 ms.
 
-## Final state
-- **26/26 EditMode tests green** (naive + Burst).
-- Run with `unity command run_tests --mode editor`.
+Array copies are minimized via the Advanced Mesh API (`SetVertexBufferData` /
+`SetIndexBufferData`) for output and `AcquireReadOnlyMeshData` for input. The
+Burst pipeline is: read → parallel count → prefix-sum → parallel write → cap
+triangulation (managed) → upload. The remaining largest phase is cap generation
+(managed); porting the cap chaining and triangulation to Burst would be the next
+optimization lever.
 
----
+## Development time
 
-**Time taken:** approximately **51 minutes**.
+The full implementation — writing the tests first, the naive slicer, the visual
+verification scene, the performance baseline, and the three Burst optimization
+iterations — took **49 minutes 41 seconds** of active work in a single agent
+session. This was an autonomous run driven by an AI coding agent (Claude Code),
+including the edit → recompile → run-tests → measure loop against a live Unity
+Editor.
+

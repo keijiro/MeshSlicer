@@ -1,4 +1,3 @@
-using System;
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Jobs;
@@ -9,453 +8,364 @@ using Plane = Unity.Mathematics.Geometry.Plane;
 
 namespace MeshSlicer {
 
-// Burst + Jobs + NativeArray implementation of the plane slicer. Reads the
-// source through the Advanced Mesh API (MeshData) and writes the results with
-// SetVertexBufferData / SetIndexBufferData to avoid managed array round-trips.
+// Optimized plane slicer. The heavy per-triangle classification and splitting runs
+// in a Burst-compiled job over NativeArrays; the (comparatively tiny) cap
+// triangulation stays in managed code and reuses CapBuilder/PolygonTriangulator.
+// Results are uploaded through the Advanced Mesh API (SetVertexBufferData /
+// SetIndexBufferData) to avoid the managed array round-trips of the naive path.
 public static class BurstSlicer
 {
-    // Allocating API: returns two freshly created meshes (either may be null
-    // when the source lies entirely on one side).
+    static readonly VertexAttributeDescriptor[] Layout =
+    {
+        new(VertexAttribute.Position, VertexAttributeFormat.Float32, 3),
+        new(VertexAttribute.Normal, VertexAttributeFormat.Float32, 3),
+        new(VertexAttribute.Tangent, VertexAttributeFormat.Float32, 4),
+        new(VertexAttribute.TexCoord0, VertexAttributeFormat.Float32, 2)
+    };
+
     public static SliceResult Slice(Mesh source, Plane plane)
     {
-        var pv = new NativeList<SliceVertex>(Allocator.TempJob);
-        var pi = new NativeList<int>(Allocator.TempJob);
-        var nv = new NativeList<SliceVertex>(Allocator.TempJob);
-        var ni = new NativeList<int>(Allocator.TempJob);
-
-        Compute(source, plane, pv, pi, nv, ni);
-        var posMesh = pi.Length > 0 ? Fill(new Mesh(), pv, pi, source.name + "_Positive") : null;
-        var negMesh = ni.Length > 0 ? Fill(new Mesh(), nv, ni, source.name + "_Negative") : null;
-
-        pv.Dispose(); pi.Dispose(); nv.Dispose(); ni.Dispose();
-        return new SliceResult(posMesh, negMesh);
+        var pos = new Mesh { name = source.name + "_Positive" };
+        var neg = new Mesh { name = source.name + "_Negative" };
+        var (hasPos, hasNeg) = Slice(source, plane, pos, neg);
+        if (!hasPos) { Object.DestroyImmediate(pos); pos = null; }
+        if (!hasNeg) { Object.DestroyImmediate(neg); neg = null; }
+        return new SliceResult { Positive = pos, Negative = neg };
     }
 
-    // Non-allocating API for per-frame use: rewrites the two provided meshes in
-    // place (a mesh is cleared when its side is empty). Avoids Mesh allocation
-    // and buffer churn across frames.
-    public static void Slice(Mesh source, Plane plane, Mesh positive, Mesh negative)
+    // Non-allocating overload: writes into caller-owned meshes for per-frame reuse.
+    // Returns whether each piece received any geometry.
+    // Optional phase timings (ms) for profiling; negligible overhead.
+    public static double ReadMs, JobMs, CapMs, UploadMs;
+
+    public static (bool positive, bool negative) Slice(Mesh source, Plane plane, Mesh positiveOut, Mesh negativeOut)
     {
-        if (positive == null) throw new ArgumentNullException(nameof(positive));
-        if (negative == null) throw new ArgumentNullException(nameof(negative));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        ReadSource(source, out var srcVerts, out var srcIndices);
+        ReadMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
 
-        var pv = new NativeList<SliceVertex>(Allocator.TempJob);
-        var pi = new NativeList<int>(Allocator.TempJob);
-        var nv = new NativeList<SliceVertex>(Allocator.TempJob);
-        var ni = new NativeList<int>(Allocator.TempJob);
+        var n = math.normalize(plane.Normal);
+        var extent = math.cmax((float3)source.bounds.size);
+        var eps = math.max(extent * 1e-4f, 1e-6f);
 
-        Compute(source, plane, pv, pi, nv, ni);
-        if (pi.Length > 0) Fill(positive, pv, pi, positive.name); else positive.Clear();
-        if (ni.Length > 0) Fill(negative, nv, ni, negative.name); else negative.Clear();
+        var numTris = srcIndices.Length / 3;
+        var posCount = new NativeArray<int>(numTris, Allocator.TempJob);
+        var negCount = new NativeArray<int>(numTris, Allocator.TempJob);
+        var cutCount = new NativeArray<int>(numTris, Allocator.TempJob);
 
-        pv.Dispose(); pi.Dispose(); nv.Dispose(); ni.Dispose();
+        // Pass 1 (parallel): classify each triangle and count its output.
+        new CountJob
+        {
+            Verts = srcVerts, Indices = srcIndices, PlaneN = n, PlaneD = plane.Distance, Eps = eps,
+            PosCount = posCount, NegCount = negCount, CutCount = cutCount
+        }.Schedule(numTris, 128).Complete();
+
+        // Exclusive prefix sums give each triangle a disjoint output range.
+        var posOff = new NativeArray<int>(numTris, Allocator.TempJob);
+        var negOff = new NativeArray<int>(numTris, Allocator.TempJob);
+        var cutOff = new NativeArray<int>(numTris, Allocator.TempJob);
+        var totals = new NativeArray<int>(3, Allocator.TempJob);
+        new PrefixJob
+        {
+            PosCount = posCount, NegCount = negCount, CutCount = cutCount,
+            PosOff = posOff, NegOff = negOff, CutOff = cutOff, Totals = totals
+        }.Run();
+        int totalPos = totals[0], totalNeg = totals[1], totalCut = totals[2];
+
+        var posBody = new NativeArray<Vertex>(totalPos, Allocator.TempJob);
+        var negBody = new NativeArray<Vertex>(totalNeg, Allocator.TempJob);
+        var cutArr = new NativeArray<float3>(totalCut, Allocator.TempJob);
+
+        // Pass 2 (parallel): write each triangle's split into its range.
+        new WriteJob
+        {
+            Verts = srcVerts, Indices = srcIndices, PlaneN = n, PlaneD = plane.Distance, Eps = eps,
+            PosOff = posOff, NegOff = negOff, CutOff = cutOff,
+            Pos = posBody, Neg = negBody, Cut = cutArr
+        }.Schedule(numTris, 128).Complete();
+        JobMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
+
+        var posVerts = new NativeList<Vertex>(totalPos + 256, Allocator.TempJob);
+        var negVerts = new NativeList<Vertex>(totalNeg + 256, Allocator.TempJob);
+        posVerts.AddRange(posBody);
+        negVerts.AddRange(negBody);
+        AppendCaps(n, extent, cutArr, posVerts, negVerts);
+        CapMs = sw.Elapsed.TotalMilliseconds; sw.Restart();
+
+        var hasPos = posVerts.Length >= 3;
+        var hasNeg = negVerts.Length >= 3;
+        Upload(positiveOut, posVerts);
+        Upload(negativeOut, negVerts);
+        UploadMs = sw.Elapsed.TotalMilliseconds;
+
+        srcVerts.Dispose(); srcIndices.Dispose();
+        posCount.Dispose(); negCount.Dispose(); cutCount.Dispose();
+        posOff.Dispose(); negOff.Dispose(); cutOff.Dispose(); totals.Dispose();
+        posBody.Dispose(); negBody.Dispose(); cutArr.Dispose();
+        posVerts.Dispose(); negVerts.Dispose();
+        return (hasPos, hasNeg);
     }
 
-    static void Compute(Mesh source, Plane plane,
-                        NativeList<SliceVertex> posV, NativeList<int> posI,
-                        NativeList<SliceVertex> negV, NativeList<int> negI)
-    {
-        if (source == null) throw new ArgumentNullException(nameof(source));
+    // --- input ---
 
-        using var mda = Mesh.AcquireReadOnlyMeshData(source);
-        var data = mda[0];
+    static void ReadSource(Mesh mesh, out NativeArray<Vertex> verts, out NativeArray<int> indices)
+    {
+        using var dataArray = Mesh.AcquireReadOnlyMeshData(mesh);
+        var data = dataArray[0];
         var vc = data.vertexCount;
 
-        var pos = new NativeArray<float3>(vc, Allocator.TempJob);
-        data.GetVertices(pos.Reinterpret<Vector3>());
+        var pos = new NativeArray<Vector3>(vc, Allocator.TempJob);
+        var nrm = new NativeArray<Vector3>(vc, Allocator.TempJob);
+        var tan = new NativeArray<Vector4>(vc, Allocator.TempJob);
+        var uv = new NativeArray<Vector2>(vc, Allocator.TempJob);
+        data.GetVertices(pos);
+        if (data.HasVertexAttribute(VertexAttribute.Normal)) data.GetNormals(nrm);
+        if (data.HasVertexAttribute(VertexAttribute.Tangent)) data.GetTangents(tan);
+        if (data.HasVertexAttribute(VertexAttribute.TexCoord0)) data.GetUVs(0, uv);
 
-        var nrm = new NativeArray<float3>(vc, Allocator.TempJob);
-        if (data.HasVertexAttribute(VertexAttribute.Normal))
-            data.GetNormals(nrm.Reinterpret<Vector3>());
-        else for (var i = 0; i < vc; i++) nrm[i] = new float3(0, 1, 0);
-
-        var tan = new NativeArray<float4>(vc, Allocator.TempJob);
-        if (data.HasVertexAttribute(VertexAttribute.Tangent))
-            data.GetTangents(tan.Reinterpret<Vector4>());
-        else for (var i = 0; i < vc; i++) tan[i] = new float4(1, 0, 0, 1);
-
-        var uv = new NativeArray<float2>(vc, Allocator.TempJob);
-        if (data.HasVertexAttribute(VertexAttribute.TexCoord0))
-            data.GetUVs(0, uv.Reinterpret<Vector2>());
-        else for (var i = 0; i < vc; i++) uv[i] = float2.zero;
+        verts = new NativeArray<Vertex>(vc, Allocator.TempJob);
+        new PackJob { P = pos, N = nrm, T = tan, U = uv, Out = verts }.Run(vc);
 
         var total = 0;
         for (var s = 0; s < data.subMeshCount; s++) total += data.GetSubMesh(s).indexCount;
-        var idx = new NativeArray<int>(total, Allocator.TempJob);
-        var off = 0;
+        indices = new NativeArray<int>(total, Allocator.TempJob);
+        var offset = 0;
+        var tmp = new NativeArray<int>(total, Allocator.Temp);
         for (var s = 0; s < data.subMeshCount; s++)
         {
-            var sc = data.GetSubMesh(s).indexCount;
-            data.GetIndices(idx.GetSubArray(off, sc), s);
-            off += sc;
+            var sub = data.GetSubMesh(s);
+            var slice = tmp.GetSubArray(0, sub.indexCount);
+            data.GetIndices(slice, s);
+            NativeArray<int>.Copy(slice, 0, indices, offset, sub.indexCount);
+            offset += sub.indexCount;
         }
+        tmp.Dispose();
 
-        var eps = math.length((float3)source.bounds.size) * 1e-4f;
-        var planeEq = new float4(plane.Normal, plane.SignedDistanceToPoint(float3.zero));
-
-        new SliceJob
-        {
-            Pos = pos, Nrm = nrm, Tan = tan, Uv = uv, Indices = idx,
-            PlaneEq = planeEq, Eps = eps,
-            PosV = posV, PosI = posI, NegV = negV, NegI = negI
-        }.Run();
-
-        pos.Dispose(); nrm.Dispose(); tan.Dispose(); uv.Dispose(); idx.Dispose();
+        pos.Dispose(); nrm.Dispose(); tan.Dispose(); uv.Dispose();
     }
 
-    static Mesh Fill(Mesh mesh, NativeList<SliceVertex> v, NativeList<int> i, string name)
+    // --- caps (managed, reuses the naive triangulator) ---
+
+    static void AppendCaps(float3 n, float extent, NativeArray<float3> cuts,
+                           NativeList<Vertex> pos, NativeList<Vertex> neg)
     {
-        mesh.name = name;
+        if (cuts.Length < 2) return;
+        var cap = new CapBuilder(n, extent);
+        for (var i = 0; i + 1 < cuts.Length; i += 2) cap.AddSegment(cuts[i], cuts[i + 1]);
+
+        var tris = cap.BuildCapTriangles(); // CCW in (u,v) -> normal +n
+        if (tris.Count == 0) return;
+        var pts = cap.Points;
+
+        var uAxis = math.abs(n.x) < 0.9f ? math.cross(n, new float3(1, 0, 0)) : math.cross(n, new float3(0, 1, 0));
+        var tangent = new float4(math.normalize(uAxis), 1);
+
+        Vertex Make(int i, float3 nr) => new() { Position = pts[i], Normal = nr, Tangent = tangent, UV = float2.zero };
+
+        for (var i = 0; i < tris.Count; i += 3)
+        {
+            int a = tris[i], b = tris[i + 1], c = tris[i + 2];
+            pos.Add(Make(a, -n)); pos.Add(Make(c, -n)); pos.Add(Make(b, -n)); // reversed -> faces -n
+            neg.Add(Make(a, n)); neg.Add(Make(b, n)); neg.Add(Make(c, n));     // faces +n
+        }
+    }
+
+    // --- output ---
+
+    static void Upload(Mesh mesh, NativeList<Vertex> verts)
+    {
         mesh.Clear();
-        mesh.SetVertexBufferParams(v.Length, SliceVertex.Layout);
-        mesh.SetVertexBufferData(v.AsArray(), 0, 0, v.Length);
-        mesh.SetIndexBufferParams(i.Length, IndexFormat.UInt32);
-        mesh.SetIndexBufferData(i.AsArray(), 0, 0, i.Length);
+        var count = verts.Length;
+        if (count < 3) return;
+
+        mesh.SetVertexBufferParams(count, Layout);
+        mesh.SetVertexBufferData(verts.AsArray(), 0, 0, count);
+
+        var indices = new NativeArray<int>(count, Allocator.TempJob);
+        new IdentityJob { Out = indices }.Run(count);
+        mesh.SetIndexBufferParams(count, IndexFormat.UInt32);
+        mesh.SetIndexBufferData(indices, 0, 0, count);
+        indices.Dispose();
+
         mesh.subMeshCount = 1;
-        mesh.SetSubMesh(0, new SubMeshDescriptor(0, i.Length));
+        mesh.SetSubMesh(0, new SubMeshDescriptor(0, count));
         mesh.RecalculateBounds();
-        return mesh;
     }
 
-    // ---- Job ------------------------------------------------------------
+    // --- jobs ---
 
-    struct PV
+    [BurstCompile]
+    struct PackJob : IJobParallelFor
     {
-        public bool IsCut;
-        public int Src;
-        public long Edge;
-        public int Boundary;
-        public SliceVertex V;
-    }
-
-    struct NativeBuilder
-    {
-        public NativeList<SliceVertex> V;
-        public NativeList<int> I;
-        public NativeHashMap<int, int> OrigMap;
-        public NativeHashMap<long, int> WallMap;
-        public NativeHashMap<int, int> CapMap;
-
-        public int AddOriginal(int src, in SliceVertex v)
+        [ReadOnly] public NativeArray<Vector3> P, N;
+        [ReadOnly] public NativeArray<Vector4> T;
+        [ReadOnly] public NativeArray<Vector2> U;
+        [WriteOnly] public NativeArray<Vertex> Out;
+        public void Execute(int i) => Out[i] = new Vertex
         {
-            if (OrigMap.TryGetValue(src, out var i)) return i;
-            i = V.Length; V.Add(v); OrigMap.Add(src, i); return i;
-        }
-
-        public int AddWall(long edge, in SliceVertex v)
-        {
-            if (WallMap.TryGetValue(edge, out var i)) return i;
-            i = V.Length; V.Add(v); WallMap.Add(edge, i); return i;
-        }
-
-        public int AddCap(int b, in SliceVertex v)
-        {
-            if (CapMap.TryGetValue(b, out var i)) return i;
-            i = V.Length; V.Add(v); CapMap.Add(b, i); return i;
-        }
-
-        public void Tri(int a, int b, int c) { I.Add(a); I.Add(b); I.Add(c); }
+            Position = P[i], Normal = N[i], Tangent = T[i], UV = U[i]
+        };
     }
 
     [BurstCompile]
-    struct SliceJob : IJob
+    struct IdentityJob : IJobParallelFor
     {
-        const float WeldGrid = 1e-5f;
+        [WriteOnly] public NativeArray<int> Out;
+        public void Execute(int i) => Out[i] = i;
+    }
 
-        [ReadOnly] public NativeArray<float3> Pos;
-        [ReadOnly] public NativeArray<float3> Nrm;
-        [ReadOnly] public NativeArray<float4> Tan;
-        [ReadOnly] public NativeArray<float2> Uv;
+    // Pass 1: per-triangle output sizes.
+    [BurstCompile]
+    struct CountJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<Vertex> Verts;
         [ReadOnly] public NativeArray<int> Indices;
-        public float4 PlaneEq;
-        public float Eps;
+        public float3 PlaneN; public float PlaneD; public float Eps;
+        [WriteOnly] public NativeArray<int> PosCount, NegCount, CutCount;
 
-        public NativeList<SliceVertex> PosV, NegV;
-        public NativeList<int> PosI, NegI;
-
-        // Boundary-point welding (cut vertices deduplicated by position).
-        struct Weld
+        public void Execute(int t)
         {
-            public NativeHashMap<int3, int> Map;
-            public NativeList<float3> Pos;
-
-            public int Get(float3 p)
-            {
-                var key = (int3)math.round(p / WeldGrid);
-                if (Map.TryGetValue(key, out var id)) return id;
-                id = Pos.Length;
-                Map.Add(key, id);
-                Pos.Add(p);
-                return id;
-            }
+            var i = t * 3;
+            Geo.Plan(Verts[Indices[i]].Position, Verts[Indices[i + 1]].Position, Verts[Indices[i + 2]].Position,
+                     PlaneN, PlaneD, Eps, out var p, out var ng, out var cu);
+            PosCount[t] = p; NegCount[t] = ng; CutCount[t] = cu;
         }
+    }
+
+    // Exclusive prefix sums + totals.
+    [BurstCompile]
+    struct PrefixJob : IJob
+    {
+        [ReadOnly] public NativeArray<int> PosCount, NegCount, CutCount;
+        [WriteOnly] public NativeArray<int> PosOff, NegOff, CutOff;
+        [WriteOnly] public NativeArray<int> Totals;
 
         public void Execute()
         {
-            var vc = Pos.Length;
-            var dist = new NativeArray<float>(vc, Allocator.Temp);
-            for (var i = 0; i < vc; i++)
+            int ap = 0, an = 0, ac = 0;
+            for (var t = 0; t < PosCount.Length; t++)
             {
-                var d = math.dot(PlaneEq.xyz, Pos[i]) + PlaneEq.w;
-                dist[i] = math.abs(d) < Eps ? 0f : d;
+                PosOff[t] = ap; ap += PosCount[t];
+                NegOff[t] = an; an += NegCount[t];
+                CutOff[t] = ac; ac += CutCount[t];
             }
+            Totals[0] = ap; Totals[1] = an; Totals[2] = ac;
+        }
+    }
 
-            var weld = new Weld
+    // Pass 2: write each triangle's split into its reserved range.
+    [BurstCompile]
+    unsafe struct WriteJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<Vertex> Verts;
+        [ReadOnly] public NativeArray<int> Indices;
+        public float3 PlaneN; public float PlaneD; public float Eps;
+        [ReadOnly] public NativeArray<int> PosOff, NegOff, CutOff;
+        [NativeDisableParallelForRestriction] public NativeArray<Vertex> Pos, Neg;
+        [NativeDisableParallelForRestriction] public NativeArray<float3> Cut;
+
+        public void Execute(int t)
+        {
+            var i = t * 3;
+            Geo.Write(Verts[Indices[i]], Verts[Indices[i + 1]], Verts[Indices[i + 2]],
+                      PlaneN, PlaneD, Eps, PosOff[t], NegOff[t], CutOff[t], Pos, Neg, Cut);
+        }
+    }
+
+    // Shared per-triangle geometry, used identically by the count and write passes.
+    static class Geo
+    {
+        static float Dist(float3 p, float3 pn, float pd, float eps)
+        {
+            var d = math.dot(pn, p) + pd;
+            return math.abs(d) <= eps ? 0f : d;
+        }
+
+        public static void Plan(float3 a, float3 b, float3 c, float3 pn, float pd, float eps,
+                                out int posV, out int negV, out int cutV)
+        {
+            float da = Dist(a, pn, pd, eps), db = Dist(b, pn, pd, eps), dc = Dist(c, pn, pd, eps);
+            var sp = da > 0 || db > 0 || dc > 0;
+            var sn = da < 0 || db < 0 || dc < 0;
+
+            var cn = 0;
+            if (da == 0) cn++;
+            if (db == 0) cn++;
+            if (dc == 0) cn++;
+            if ((da > 0 && db < 0) || (da < 0 && db > 0)) cn++;
+            if ((db > 0 && dc < 0) || (db < 0 && dc > 0)) cn++;
+            if ((dc > 0 && da < 0) || (dc < 0 && da > 0)) cn++;
+            cutV = cn == 2 ? 2 : 0;
+
+            posV = 0; negV = 0;
+            if (sp && sn)
             {
-                Map = new NativeHashMap<int3, int>(64, Allocator.Temp),
-                Pos = new NativeList<float3>(64, Allocator.Temp)
-            };
-
-            var pos = NewBuilder(PosV, PosI);
-            var neg = NewBuilder(NegV, NegI);
-            var capPos = new NativeList<int2>(Allocator.Temp);
-            var capNeg = new NativeList<int2>(Allocator.Temp);
-            var pp = new NativeList<PV>(Allocator.Temp);
-            var np = new NativeList<PV>(Allocator.Temp);
-
-            for (var t = 0; t < Indices.Length; t += 3)
-            {
-                int i0 = Indices[t], i1 = Indices[t + 1], i2 = Indices[t + 2];
-                float d0 = dist[i0], d1 = dist[i1], d2 = dist[i2];
-                bool p0 = d0 >= 0, p1 = d1 >= 0, p2 = d2 >= 0;
-
-                if (p0 && p1 && p2) { EmitWhole(ref pos, i0, i1, i2); continue; }
-                if (!p0 && !p1 && !p2) { EmitWhole(ref neg, i0, i1, i2); continue; }
-
-                pp.Clear(); np.Clear();
-                ClipEdge(pp, np, i0, i1, d0, d1, ref weld);
-                ClipEdge(pp, np, i1, i2, d1, d2, ref weld);
-                ClipEdge(pp, np, i2, i0, d2, d0, ref weld);
-                FanEmit(ref pos, pp);
-                FanEmit(ref neg, np);
-                ExtractCap(pp, capPos);
-                ExtractCap(np, capNeg);
+                var mp = ClipCount(da, db, dc, true);
+                var mn = ClipCount(da, db, dc, false);
+                posV = mp >= 3 ? (mp - 2) * 3 : 0;
+                negV = mn >= 3 ? (mn - 2) * 3 : 0;
             }
-
-            var n = math.normalize(PlaneEq.xyz);
-            var refv = math.abs(n.x) < 0.9f ? new float3(1, 0, 0) : new float3(0, 1, 0);
-            var u = math.normalize(math.cross(refv, n));
-            var w = math.cross(n, u);
-            BuildCap(ref pos, capPos, u, w, n, weld.Pos);
-            BuildCap(ref neg, capNeg, u, w, n, weld.Pos);
+            else if (sp) posV = 3;
+            else if (sn) negV = 3;
         }
 
-        NativeBuilder NewBuilder(NativeList<SliceVertex> v, NativeList<int> i) => new NativeBuilder
+        public static unsafe void Write(in Vertex a, in Vertex b, in Vertex c, float3 pn, float pd, float eps,
+                                        int posOff, int negOff, int cutOff,
+                                        NativeArray<Vertex> pos, NativeArray<Vertex> neg, NativeArray<float3> cut)
         {
-            V = v, I = i,
-            OrigMap = new NativeHashMap<int, int>(64, Allocator.Temp),
-            WallMap = new NativeHashMap<long, int>(64, Allocator.Temp),
-            CapMap = new NativeHashMap<int, int>(64, Allocator.Temp)
-        };
+            float da = Dist(a.Position, pn, pd, eps), db = Dist(b.Position, pn, pd, eps), dc = Dist(c.Position, pn, pd, eps);
+            var sp = da > 0 || db > 0 || dc > 0;
+            var sn = da < 0 || db < 0 || dc < 0;
 
-        SliceVertex VtxOf(int i) => new SliceVertex
-        {
-            Position = Pos[i], Normal = Nrm[i], Tangent = Tan[i], Uv = Uv[i]
-        };
+            var cp = stackalloc Vertex[2];
+            var cn = 0;
+            if (da == 0 && cn < 2) cp[cn++] = a;
+            if (db == 0 && cn < 2) cp[cn++] = b;
+            if (dc == 0 && cn < 2) cp[cn++] = c;
+            if (((da > 0 && db < 0) || (da < 0 && db > 0)) && cn < 2) cp[cn++] = Vertex.Lerp(a, b, da / (da - db));
+            if (((db > 0 && dc < 0) || (db < 0 && dc > 0)) && cn < 2) cp[cn++] = Vertex.Lerp(b, c, db / (db - dc));
+            if (((dc > 0 && da < 0) || (dc < 0 && da > 0)) && cn < 2) cp[cn++] = Vertex.Lerp(c, a, dc / (dc - da));
+            if (cn == 2) { cut[cutOff] = cp[0].Position; cut[cutOff + 1] = cp[1].Position; }
 
-        PV Original(int i, bool onPlane, ref Weld weld) => new PV
-        {
-            IsCut = false, Src = i, Boundary = onPlane ? weld.Get(Pos[i]) : -1, V = VtxOf(i)
-        };
-
-        PV Interp(int a, int b, float s, ref Weld weld)
-        {
-            var tan = math.lerp(Tan[a], Tan[b], s);
-            var txyz = math.normalizesafe(tan.xyz, new float3(1, 0, 0));
-            var p = math.lerp(Pos[a], Pos[b], s);
-            var v = new SliceVertex
+            if (sp && sn)
             {
-                Position = p,
-                Normal = math.normalizesafe(math.lerp(Nrm[a], Nrm[b], s), new float3(0, 1, 0)),
-                Tangent = new float4(txyz, Tan[a].w),
-                Uv = math.lerp(Uv[a], Uv[b], s)
-            };
-            return new PV { IsCut = true, Edge = EdgeKey(a, b), Boundary = weld.Get(p), V = v };
-        }
-
-        void EmitWhole(ref NativeBuilder buf, int i0, int i1, int i2)
-        {
-            var a = buf.AddOriginal(i0, VtxOf(i0));
-            var b = buf.AddOriginal(i1, VtxOf(i1));
-            var c = buf.AddOriginal(i2, VtxOf(i2));
-            buf.Tri(a, b, c);
-        }
-
-        void ClipEdge(NativeList<PV> pp, NativeList<PV> np, int a, int b, float da, float db, ref Weld weld)
-        {
-            if (da > 0) pp.Add(Original(a, false, ref weld));
-            else if (da < 0) np.Add(Original(a, false, ref weld));
-            else { var v = Original(a, true, ref weld); pp.Add(v); np.Add(v); }
-
-            if (da * db >= 0) return;
-
-            var s = da / (da - db);
-            var ip = Interp(a, b, s, ref weld);
-            pp.Add(ip); np.Add(ip);
-        }
-
-        void FanEmit(ref NativeBuilder buf, NativeList<PV> poly)
-        {
-            if (poly.Length < 3) return;
-            var i0 = Resolve(ref buf, poly[0]);
-            for (var k = 1; k < poly.Length - 1; k++)
-            {
-                var i1 = Resolve(ref buf, poly[k]);
-                var i2 = Resolve(ref buf, poly[k + 1]);
-                buf.Tri(i0, i1, i2);
+                var poly = stackalloc Vertex[4];
+                var m = ClipHalf(a, b, c, da, db, dc, true, poly);
+                var w = posOff;
+                for (var k = 1; k + 1 < m; k++) { pos[w++] = poly[0]; pos[w++] = poly[k]; pos[w++] = poly[k + 1]; }
+                m = ClipHalf(a, b, c, da, db, dc, false, poly);
+                w = negOff;
+                for (var k = 1; k + 1 < m; k++) { neg[w++] = poly[0]; neg[w++] = poly[k]; neg[w++] = poly[k + 1]; }
             }
+            else if (sp) { pos[posOff] = a; pos[posOff + 1] = b; pos[posOff + 2] = c; }
+            else if (sn) { neg[negOff] = a; neg[negOff + 1] = b; neg[negOff + 2] = c; }
         }
 
-        static int Resolve(ref NativeBuilder buf, in PV v) =>
-            v.IsCut ? buf.AddWall(v.Edge, v.V) : buf.AddOriginal(v.Src, v.V);
+        static int ClipCount(float da, float db, float dc, bool keepPos)
+            => EdgeCount(da, db, keepPos) + EdgeCount(db, dc, keepPos) + EdgeCount(dc, da, keepPos);
 
-        static void ExtractCap(NativeList<PV> poly, NativeList<int2> caps)
+        static int EdgeCount(float dc, float dn, bool keepPos)
         {
-            var m = poly.Length;
-            if (m < 3) return;
-            for (var i = 0; i < m; i++)
-            {
-                var c = poly[i];
-                var d = poly[(i + 1) % m];
-                if (c.Boundary >= 0 && d.Boundary >= 0 && c.Boundary != d.Boundary)
-                    caps.Add(new int2(d.Boundary, c.Boundary));
-            }
+            var n = (keepPos ? dc >= 0 : dc <= 0) ? 1 : 0;
+            if ((dc > 0 && dn < 0) || (dc < 0 && dn > 0)) n++;
+            return n;
         }
 
-        static long EdgeKey(int a, int b)
+        static unsafe int ClipHalf(in Vertex a, in Vertex b, in Vertex c, float da, float db, float dc, bool keepPos, Vertex* outPoly)
         {
-            int lo = math.min(a, b), hi = math.max(a, b);
-            return ((long)lo << 32) | (uint)hi;
+            var n = 0;
+            ClipEdge(a, b, da, db, keepPos, outPoly, ref n);
+            ClipEdge(b, c, db, dc, keepPos, outPoly, ref n);
+            ClipEdge(c, a, dc, da, keepPos, outPoly, ref n);
+            return n;
         }
 
-        void BuildCap(ref NativeBuilder buf, NativeList<int2> caps, float3 u, float3 w, float3 n,
-                      NativeList<float3> boundaryPos)
+        static unsafe void ClipEdge(in Vertex cur, in Vertex nxt, float dc, float dn, bool keepPos, Vertex* outPoly, ref int n)
         {
-            if (caps.Length == 0) return;
-            var bc = boundaryPos.Length;
-            var next = new NativeArray<int>(bc, Allocator.Temp);
-            for (var i = 0; i < bc; i++) next[i] = -1;
-            for (var i = 0; i < caps.Length; i++) next[caps[i].x] = caps[i].y;
-
-            var visited = new NativeArray<bool>(bc, Allocator.Temp);
-            var loop = new NativeList<int>(Allocator.Temp);
-            var pts = new NativeList<float2>(Allocator.Temp);
-            var tris = new NativeList<int>(Allocator.Temp);
-            var capTan = new float4(u, 1f);
-
-            for (var start = 0; start < bc; start++)
-            {
-                if (next[start] < 0 || visited[start]) continue;
-
-                loop.Clear();
-                var cur = start;
-                while (cur >= 0 && !visited[cur])
-                {
-                    visited[cur] = true;
-                    loop.Add(cur);
-                    cur = next[cur];
-                    if (cur == start) break;
-                }
-                if (loop.Length < 3) continue;
-
-                pts.Clear();
-                for (var i = 0; i < loop.Length; i++)
-                {
-                    var p = boundaryPos[loop[i]];
-                    pts.Add(new float2(math.dot(p, u), math.dot(p, w)));
-                }
-
-                tris.Clear();
-                EarClip(pts, tris);
-                var loopCcw = SignedArea(pts) > 0f;
-                var capNrm = loopCcw ? n : -n;
-
-                for (var i = 0; i < tris.Length; i += 3)
-                {
-                    int ka = loop[tris[i]], kb = loop[tris[i + 1]], kc = loop[tris[i + 2]];
-                    var la = buf.AddCap(ka, CapVtx(boundaryPos[ka], capNrm, capTan));
-                    var lb = buf.AddCap(kb, CapVtx(boundaryPos[kb], capNrm, capTan));
-                    var lc = buf.AddCap(kc, CapVtx(boundaryPos[kc], capNrm, capTan));
-                    if (loopCcw) buf.Tri(la, lb, lc);
-                    else buf.Tri(la, lc, lb);
-                }
-            }
-        }
-
-        static SliceVertex CapVtx(float3 p, float3 n, float4 tan) => new SliceVertex
-        {
-            Position = p, Normal = n, Tangent = tan, Uv = float2.zero
-        };
-
-        // ---- Ear clipping (2D) ------------------------------------------
-
-        static void EarClip(NativeList<float2> pts, NativeList<int> outTris)
-        {
-            var n = pts.Length;
-            if (n < 3) return;
-
-            var v = new NativeList<int>(n, Allocator.Temp);
-            for (var i = 0; i < n; i++) v.Add(i);
-            if (SignedArea(pts) < 0)
-            {
-                for (int i = 0, j = v.Length - 1; i < j; i++, j--)
-                    (v[i], v[j]) = (v[j], v[i]);
-            }
-
-            var guard = 0;
-            var maxGuard = n * n + 8;
-            while (v.Length > 3 && guard++ < maxGuard)
-            {
-                var eared = false;
-                var count = v.Length;
-                for (var i = 0; i < count; i++)
-                {
-                    int i0 = v[(i - 1 + count) % count], i1 = v[i], i2 = v[(i + 1) % count];
-                    if (!IsEar(pts, v, i0, i1, i2)) continue;
-                    outTris.Add(i0); outTris.Add(i1); outTris.Add(i2);
-                    v.RemoveAt(i);
-                    eared = true;
-                    break;
-                }
-                if (!eared) break;
-            }
-            if (v.Length == 3) { outTris.Add(v[0]); outTris.Add(v[1]); outTris.Add(v[2]); }
-        }
-
-        static bool IsEar(NativeList<float2> pts, NativeList<int> ring, int i0, int i1, int i2)
-        {
-            float2 a = pts[i0], b = pts[i1], c = pts[i2];
-            if (Cross(b - a, c - a) <= 0f) return false;
-            for (var k = 0; k < ring.Length; k++)
-            {
-                var idx = ring[k];
-                if (idx == i0 || idx == i1 || idx == i2) continue;
-                if (PointInTriangle(pts[idx], a, b, c)) return false;
-            }
-            return true;
-        }
-
-        static float Cross(float2 a, float2 b) => a.x * b.y - a.y * b.x;
-
-        static bool PointInTriangle(float2 p, float2 a, float2 b, float2 c)
-        {
-            var d1 = Cross(p - a, b - a);
-            var d2 = Cross(p - b, c - b);
-            var d3 = Cross(p - c, a - c);
-            var hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
-            var hasPos = d1 > 0 || d2 > 0 || d3 > 0;
-            return !(hasNeg && hasPos);
-        }
-
-        static float SignedArea(NativeList<float2> pts)
-        {
-            var a = 0f;
-            for (int i = 0, m = pts.Length; i < m; i++)
-            {
-                float2 p = pts[i], q = pts[(i + 1) % m];
-                a += p.x * q.y - q.x * p.y;
-            }
-            return a * 0.5f;
+            var curIn = keepPos ? dc >= 0 : dc <= 0;
+            if (curIn && n < 4) outPoly[n++] = cur;
+            if (((dc > 0 && dn < 0) || (dc < 0 && dn > 0)) && n < 4)
+                outPoly[n++] = Vertex.Lerp(cur, nxt, dc / (dc - dn));
         }
     }
 }

@@ -1,8 +1,8 @@
 {
-    "name": "MeshSlicer.Tests.EditMode",
+    "name": "MeshSlicer.Tests",
     "rootNamespace": "MeshSlicer.Tests",
     "references": [
-        "MeshSlicer",
+        "MeshSlicer.Runtime",
         "Unity.Mathematics",
         "UnityEngine.TestRunner",
         "UnityEditor.TestRunner"
