@@ -31,7 +31,7 @@ public class Sliceable : MonoBehaviour
         float3 localPoint = meshTransform.InverseTransformPoint((float3)worldPlane.Normal * -worldPlane.Distance);
         var localPlane = Plane.CreateFromUnitNormalAndPointInPlane(localNormal, localPoint);
 
-        var result = BurstMeshSlicer.Slice(sourceMesh, localPlane);
+        var result = BurstSlicer.Slice(sourceMesh, localPlane);
 
         if (result.Positive != null && result.Negative != null)
         {

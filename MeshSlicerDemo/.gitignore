@@ -21,3 +21,9 @@ Desktop.ini
 /*.apk
 /*.tgz
 /*_DoNotShip
+
+/Assets/AI Toolkit
+/Assets/AI Toolkit.md
+
+/.codex/config.toml
+/.mcp.json

@@ -1,5 +1,5 @@
 {
-    "name": "MeshSlicer",
+    "name": "MeshSlicer.Runtime",
     "rootNamespace": "MeshSlicer",
     "references": [
         "Unity.Mathematics",
