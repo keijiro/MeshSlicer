@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeshSlicer アルゴリズム解説</title>
+<style>
+:root {
+  --bg: #F4F6F5;
+  --panel: #FFFFFF;
+  --shape: #EBF0EE;
+  --ink: #242B30;
+  --muted: #5D6871;
+  --line: #D8DEDB;
+  --code-bg: #ECEFED;
+  --plane: #6A58C8;
+  --pos: #0E8577;
+  --neg: #C2691F;
+  --bad: #C4473F;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181C;
+    --panel: #1C2126;
+    --shape: #262D33;
+    --ink: #E2E7EA;
+    --muted: #97A2AB;
+    --line: #333B42;
+    --code-bg: #232A30;
+    --plane: #A294F0;
+    --pos: #3CBFAD;
+    --neg: #E8935A;
+    --bad: #E5675F;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14181C;
+  --panel: #1C2126;
+  --shape: #262D33;
+  --ink: #E2E7EA;
+  --muted: #97A2AB;
+  --line: #333B42;
+  --code-bg: #232A30;
+  --plane: #A294F0;
+  --pos: #3CBFAD;
+  --neg: #E8935A;
+  --bad: #E5675F;
+}
+:root[data-theme="light"] {
+  --bg: #F4F6F5;
+  --panel: #FFFFFF;
+  --shape: #EBF0EE;
+  --ink: #242B30;
+  --muted: #5D6871;
+  --line: #D8DEDB;
+  --code-bg: #ECEFED;
+  --plane: #6A58C8;
+  --pos: #0E8577;
+  --neg: #C2691F;
+  --bad: #C4473F;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic Medium", "Yu Gothic", "Noto Sans JP", sans-serif;
+  font-size: 15.5px;
+  line-height: 2.0;
+  margin: 0;
+}
+main {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 56px 24px 96px;
+}
+
+/* ---- header ---- */
+.eyebrow {
+  font-size: 12.5px;
+  letter-spacing: .14em;
+  color: var(--plane);
+  font-weight: 600;
+  margin: 0 0 14px;
+}
+h1 {
+  font-family: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif;
+  font-size: 31px;
+  font-weight: 600;
+  line-height: 1.55;
+  margin: 0 0 6px;
+  text-wrap: balance;
+}
+.subtitle {
+  font-family: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif;
+  font-size: 17px;
+  color: var(--muted);
+  margin: 0 0 26px;
+}
+.lede {
+  font-size: 16px;
+  border-left: 3px solid var(--plane);
+  padding-left: 18px;
+  margin: 0 0 10px;
+}
+.meta {
+  font-size: 12.5px;
+  color: var(--muted);
+  margin: 18px 0 0;
+}
+.meta code { font-size: 12px; }
+
+/* ---- sections ---- */
+h2 {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  font-size: 21px;
+  line-height: 1.5;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+  margin: 64px 0 22px;
+}
+h2 .no {
+  font-family: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif;
+  font-size: 27px;
+  font-weight: 600;
+  color: var(--plane);
+  min-width: 1em;
+}
+h3 {
+  font-size: 16.5px;
+  margin: 36px 0 12px;
+}
+p { margin: 0 0 18px; }
+ul, ol { margin: 0 0 18px; padding-left: 1.6em; }
+li { margin-bottom: 6px; }
+strong { font-weight: 600; }
+em { font-style: normal; font-weight: 600; color: var(--plane); }
+
+code, pre {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+code {
+  background: var(--code-bg);
+  border-radius: 3px;
+  padding: .12em .38em;
+  font-size: .86em;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 16px 18px;
+  font-size: 13px;
+  line-height: 1.75;
+  overflow-x: auto;
+  margin: 0 0 18px;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+
+.term-pos { color: var(--pos); font-weight: 600; }
+.term-neg { color: var(--neg); font-weight: 600; }
+.term-plane { color: var(--plane); font-weight: 600; }
+
+/* ---- pipeline ---- */
+.pipeline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 8px;
+  margin: 26px 0;
+}
+.pl-step {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 7px 13px 7px 9px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.pl-step .n {
+  font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
+  color: var(--plane);
+  font-weight: 600;
+  font-size: 14px;
+}
+.pl-arr { color: var(--muted); font-size: 13px; }
+
+/* ---- figures ---- */
+figure {
+  margin: 30px 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 20px 16px 10px;
+}
+figure svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+figcaption {
+  border-top: 1px dashed var(--line);
+  margin-top: 12px;
+  padding: 10px 6px 6px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--muted);
+}
+.figno { color: var(--plane); font-weight: 600; font-style: normal; margin-right: .6em; }
+
+/* ---- SVG classes ---- */
+svg text { font-family: inherit; font-size: 12.5px; fill: var(--muted); }
+svg .tt { fill: var(--ink); font-weight: 600; }
+svg .tpos { fill: var(--pos); font-weight: 600; }
+svg .tneg { fill: var(--neg); font-weight: 600; }
+svg .tplane { fill: var(--plane); font-weight: 600; }
+svg .tbad { fill: var(--bad); font-weight: 600; }
+svg .small { font-size: 11px; }
+svg .mid { text-anchor: middle; }
+svg .end { text-anchor: end; }
+svg .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; }
+
+svg .shape { fill: var(--shape); stroke: var(--ink); stroke-width: 1.6; }
+svg .outline { fill: none; stroke: var(--ink); stroke-width: 1.7; }
+svg .sk { stroke: var(--ink); stroke-width: 1.8; fill: none; }
+svg .sp { stroke: var(--plane); stroke-width: 1.6; fill: none; }
+svg .fp { fill: var(--plane); }
+svg .dash { stroke-dasharray: 7 5; }
+svg .faint { opacity: .32; }
+svg .planeface { fill: var(--plane); fill-opacity: .08; stroke: var(--plane); stroke-width: 1.4; stroke-dasharray: 7 5; }
+svg .planeband { fill: var(--plane); fill-opacity: .09; }
+svg .tri-pos { fill: var(--pos); fill-opacity: .12; stroke: var(--pos); stroke-width: 1.7; }
+svg .tri-neg { fill: var(--neg); fill-opacity: .12; stroke: var(--neg); stroke-width: 1.7; }
+svg .cap-pos { fill: var(--pos); fill-opacity: .18; stroke: var(--pos); stroke-width: 1.6; }
+svg .cap-neg { fill: var(--neg); fill-opacity: .18; stroke: var(--neg); stroke-width: 1.6; }
+svg .dot-pos { fill: var(--pos); }
+svg .dot-neg { fill: var(--neg); }
+svg .dot-plane { fill: var(--plane); }
+svg .dot-ink { fill: var(--ink); }
+svg .dot-bad { fill: var(--bad); }
+svg .ring-bad { fill: none; stroke: var(--bad); stroke-width: 2; }
+svg .cutseg { stroke: var(--plane); stroke-width: 3.4; stroke-linecap: round; }
+svg .seg { stroke: var(--ink); stroke-width: 2.4; stroke-linecap: round; fill: none; }
+svg .thin { stroke: var(--muted); stroke-width: 1; opacity: .6; }
+svg .bridge { stroke: var(--plane); stroke-width: 3.2; stroke-linecap: round; }
+svg .leader { stroke: var(--muted); stroke-width: 1; }
+svg .narrow line { stroke: var(--muted); stroke-width: 2; }
+svg .narrow polygon { fill: var(--muted); }
+svg .narrow.accent line { stroke: var(--plane); }
+svg .narrow.accent polygon { fill: var(--plane); }
+svg .axis { stroke: var(--muted); stroke-width: 1.3; }
+svg .tick { stroke: var(--muted); stroke-width: 1.3; }
+svg .tick0 { stroke: var(--ink); stroke-width: 1.8; }
+
+/* ---- table ---- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  margin: 0 0 18px;
+}
+th, td {
+  text-align: left;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+th {
+  font-size: 12px;
+  letter-spacing: .06em;
+  color: var(--muted);
+  font-weight: 600;
+}
+td code { white-space: nowrap; }
+.table-wrap { overflow-x: auto; }
+
+footer {
+  margin-top: 72px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+  font-size: 12.5px;
+  color: var(--muted);
+}
+</style>
+
+<main>
+<p class="eyebrow">MESHSLICER / RUNTIME — アルゴリズムノート</p>
+<h1>平面によるメッシュ切断の仕組み</h1>
+<p class="subtitle">三角形の分類・クリップから、切り口を塞ぐキャップ生成まで</p>
+
+<p class="lede">
+MeshSlicer は、水密(2-manifold)なメッシュを無限平面で切断し、切り口に蓋(キャップ)をした
+2 つの閉じたメッシュを返すライブラリです。本稿では <code>Slicer.Slice(Mesh, Plane)</code> が
+内部で行っている基本的な処理を、パイプラインの順に沿って解説します。
+</p>
+<p class="meta">
+対象コード: <code>Assets/MeshSlicer/Runtime/</code>(Slicer.cs / Vertex.cs / CapBuilder.cs / PolygonTriangulator.cs ほか)。
+Burst による高速化実装(BurstSlicer.cs)は本稿の範囲外です。
+</p>
+
+<!-- ================================================================ -->
+<h2><span class="no">1</span>入力と出力</h2>
+
+<p>
+入力は切断対象の <code>Mesh</code> と、メッシュのローカル空間で定義された平面
+(法線 <code>n</code> と距離 <code>d</code>)です。出力は <code>SliceResult</code> で、
+法線が指す側の破片 <span class="term-pos">Positive</span> と、その反対側の破片
+<span class="term-neg">Negative</span> の 2 つのメッシュを持ちます。
+メッシュ全体が片側に収まっていた場合、もう一方は <code>null</code> になります。
+</p>
+
+<figure>
+<svg viewBox="0 0 720 290" role="img" aria-label="球を平面で切断し、キャップ付きの 2 つの破片が得られる概要図">
+  <!-- source mesh -->
+  <g transform="translate(130,140)">
+    <circle r="80" class="shape"/>
+    <ellipse cy="20" rx="110" ry="22" class="planeface"/>
+    <line x1="95" y1="20" x2="95" y2="-38" class="sp"/>
+    <polygon points="95,-48 90,-37 100,-37" class="fp"/>
+    <text x="104" y="-34">法線 n</text>
+    <text x="-114" y="55" class="tplane">切断平面</text>
+    <text y="112" class="mid">元のメッシュ(水密)</text>
+  </g>
+  <!-- arrow -->
+  <line x1="283" y1="140" x2="345" y2="140" class="sk"/>
+  <polygon points="355,140 344,135 344,145" class="dot-ink"/>
+  <text x="318" y="126" class="mid mono">Slice()</text>
+  <!-- result -->
+  <g transform="translate(520,140)">
+    <path d="M -77.5,-15 A 80 80 0 1 1 77.5,-15 Z" class="shape"/>
+    <ellipse cy="-15" rx="77.5" ry="16" class="cap-pos"/>
+    <path d="M -77.5,75 A 80 80 0 0 0 77.5,75 Z" class="shape"/>
+    <ellipse cy="75" rx="77.5" ry="16" class="cap-neg"/>
+    <text x="92" y="-44" class="tpos">Positive</text>
+    <text x="92" y="-27" class="small">n の指す側</text>
+    <text x="92" y="70" class="tneg">Negative</text>
+    <text x="92" y="87" class="small">反対側</text>
+    <text x="-98" y="36" class="end">キャップ</text>
+    <line x1="-94" y1="26" x2="-72" y2="-10" class="leader"/>
+    <line x1="-94" y1="34" x2="-74" y2="66" class="leader"/>
+  </g>
+</svg>
+<figcaption><span class="figno">図 1</span>切断の入出力。破片はどちらも切り口が
+キャップで塞がれた閉じたメッシュとして返される。Positive 側のキャップは −n 向き、
+Negative 側のキャップは +n 向きの法線を持つ。</figcaption>
+</figure>
+
+<!-- ================================================================ -->
+<h2><span class="no">2</span>処理の流れ</h2>
+
+<p>全体のパイプラインは次の 6 段階です。</p>
+
+<div class="pipeline">
+  <div class="pl-step"><span class="n">1</span>頂点の符号付き距離を計算</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">2</span>切断位置のプローブとオフセット</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">3</span>三角形を分類・分割</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">4</span>切断線分を収集</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">5</span>ループ化して三角形分割</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">6</span>キャップを両側に追加</div>
+</div>
+
+<p>
+中核となるのは 3〜6 の「三角形を平面で切り分け、切り口を蓋する」処理です。
+ステップ 2 の「オフセット」は、平面がちょうど頂点や辺の上を通ってしまう
+<strong>縮退ケース</strong>を避けるための前処理で、第 6 節で詳しく説明します。
+</p>
+
+<!-- ================================================================ -->
+<h2><span class="no">3</span>符号付き距離による頂点の分類</h2>
+
+<p>
+まず全頂点について、平面からの<strong>符号付き距離</strong>
+<code>d = dot(n, p) + plane.d</code> を計算します。符号が正なら法線側、
+負なら反対側です。ただしそのまま使うのではなく、平面のごく近く
+(許容誤差 <em>ε</em> 以内)にある頂点は距離を 0 に丸めて
+「<strong>平面上の頂点</strong>」として扱います。
+</p>
+
+<pre><code>static float SignedDist(float3 p, float3 n, float d, float eps)
+{
+    var s = math.dot(n, p) + d;
+    return math.abs(s) &lt;= eps ? 0f : s;   // 平面近傍は「平面上」に丸める
+}</code></pre>
+
+<p>
+<em>ε</em> はモデルの大きさに比例して決まります
+(<code>ε = max(バウンディングボックス最大辺 × 10⁻⁴, 10⁻⁶)</code>)。
+浮動小数点誤差で「わずかに正/わずかに負」と判定がぶれる頂点を、
+一貫して平面上として扱うためのしきい値です。
+</p>
+
+<p>三角形は 3 頂点の距離の符号によって、次の 3 通りに振り分けられます。</p>
+
+<figure>
+<svg viewBox="0 0 720 252" role="img" aria-label="平面に対する三角形の 3 分類">
+  <!-- eps band + plane -->
+  <rect x="20" y="132" width="680" height="16" class="planeband"/>
+  <line x1="20" y1="140" x2="700" y2="140" class="sp dash"/>
+  <!-- normal arrow -->
+  <line x1="44" y1="126" x2="44" y2="88" class="sp"/>
+  <polygon points="44,79 39,89 49,89" class="fp"/>
+  <text x="54" y="94">n</text>
+  <text x="24" y="168" class="small">±ε の帯 → d = 0 扱い</text>
+  <text x="700" y="118" class="end small">d &gt; 0 の側</text>
+  <text x="700" y="166" class="end small">d &lt; 0 の側</text>
+  <!-- T1 all positive -->
+  <polygon points="140,45 205,85 120,105" class="tri-pos"/>
+  <circle cx="140" cy="45" r="3.5" class="dot-pos"/>
+  <circle cx="205" cy="85" r="3.5" class="dot-pos"/>
+  <circle cx="120" cy="105" r="3.5" class="dot-pos"/>
+  <text x="160" y="240" class="mid">すべて d ≥ 0 → <tspan class="tpos">Positive</tspan></text>
+  <!-- T2 straddle -->
+  <polygon points="340,70 430,95 370,205" class="outline"/>
+  <line x1="356" y1="140" x2="405" y2="140" class="cutseg"/>
+  <circle cx="340" cy="70" r="3.5" class="dot-pos"/>
+  <circle cx="430" cy="95" r="3.5" class="dot-pos"/>
+  <circle cx="370" cy="205" r="3.5" class="dot-neg"/>
+  <text x="330" y="63" class="end small mono">d&gt;0</text>
+  <text x="440" y="91" class="small mono">d&gt;0</text>
+  <text x="381" y="213" class="small mono">d&lt;0</text>
+  <text x="385" y="240" class="mid">符号が混在 → <tspan class="tplane">分割</tspan></text>
+  <!-- T3 all negative -->
+  <polygon points="560,165 640,180 585,225" class="tri-neg"/>
+  <circle cx="560" cy="165" r="3.5" class="dot-neg"/>
+  <circle cx="640" cy="180" r="3.5" class="dot-neg"/>
+  <circle cx="585" cy="225" r="3.5" class="dot-neg"/>
+  <text x="600" y="240" class="mid">すべて d ≤ 0 → <tspan class="tneg">Negative</tspan></text>
+</svg>
+<figcaption><span class="figno">図 2</span>三角形の分類。全頂点が片側にあれば
+そのまま該当する破片へコピーする。符号が混在する三角形だけが分割の対象になる。
+中央の太い線分は三角形と平面の交線で、キャップ生成(第 5 節)に送られる。</figcaption>
+</figure>
+
+<ul>
+  <li>すべて <code>d ≥ 0</code> — そのまま <span class="term-pos">Positive</span> 側へコピー</li>
+  <li>すべて <code>d ≤ 0</code> — そのまま <span class="term-neg">Negative</span> 側へコピー</li>
+  <li>正と負が混在 — 平面をまたいでいるので<strong>分割</strong>(次節)</li>
+  <li>3 頂点すべてが <code>d = 0</code>(平面と完全に一致する面) — 厚みのない縮退面なので破棄</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2><span class="no">4</span>またぐ三角形の分割</h2>
+
+<p>
+平面をまたぐ三角形は、<strong>Sutherland–Hodgman 法</strong>で 2 つの半空間それぞれに
+クリップします。三角形の 3 辺を順にたどり、「内側の頂点はそのまま出力、
+平面を横切る辺は交点を挿入」という規則で切り抜くと、片側は三角形または四角形の
+凸多角形になります。四角形になった場合は扇状(ファン)に 2 枚の三角形へ分けます。
+</p>
+
+<figure>
+<svg viewBox="0 0 720 300" role="img" aria-label="またぐ三角形のクリップと分割結果">
+  <text x="185" y="26" class="mid tt">分割前</text>
+  <text x="545" y="26" class="mid tt">分割後</text>
+  <!-- left: original -->
+  <line x1="50" y1="150" x2="310" y2="150" class="sp dash"/>
+  <text x="56" y="136" class="small">d &gt; 0</text>
+  <text x="56" y="174" class="small">d &lt; 0</text>
+  <polygon points="120,60 250,100 160,230" class="outline"/>
+  <line x1="141" y1="150" x2="215" y2="150" class="cutseg"/>
+  <circle cx="120" cy="60" r="4" class="dot-pos"/>
+  <circle cx="250" cy="100" r="4" class="dot-pos"/>
+  <circle cx="160" cy="230" r="4" class="dot-neg"/>
+  <circle cx="141" cy="150" r="4.5" class="dot-plane"/>
+  <circle cx="215" cy="150" r="4.5" class="dot-plane"/>
+  <text x="112" y="52" class="end tt">a</text>
+  <text x="259" y="97" class="tt">b</text>
+  <text x="160" y="248" class="mid tt">c</text>
+  <text x="133" y="170" class="end tplane">p₀</text>
+  <text x="224" y="170" class="tplane">p₁</text>
+  <line x1="220" y1="157" x2="243" y2="200" class="leader"/>
+  <text x="236" y="218" class="small">切断線分 p₀–p₁ は</text>
+  <text x="236" y="235" class="small">キャップ生成へ</text>
+  <!-- right: result -->
+  <polygon points="500,40 630,80 595,130 521,130" class="tri-pos"/>
+  <line x1="500" y1="40" x2="595" y2="130" class="sp dash" opacity=".6"/>
+  <polygon points="521,175 595,175 540,255" class="tri-neg"/>
+  <text x="488" y="46" class="end tpos">Positive 側</text>
+  <text x="488" y="64" class="end small">四角形 → 扇状に 2 枚</text>
+  <text x="509" y="198" class="end tneg">Negative 側</text>
+  <text x="509" y="216" class="end small">三角形のまま</text>
+</svg>
+<figcaption><span class="figno">図 3</span>頂点 a・b が正側、c が負側の例。
+辺 b–c と辺 c–a の上に交点 p₀・p₁ が作られ、正側は四角形 (a, b, p₁, p₀)、
+負側は三角形 (p₀, p₁, c) になる。四角形は点線の対角線で 2 枚の三角形に分割される。</figcaption>
+</figure>
+
+<p>
+なお <code>d = 0</code>(平面上)の頂点は<strong>両側の多角形に含める</strong>のがポイントです。
+これにより、頂点が平面上に乗っている三角形も隙間なく 2 つに分かれます。
+</p>
+
+<h3>交点での頂点属性の補間</h3>
+
+<p>
+辺と平面の交点位置は、両端の符号付き距離から比率
+<code>t = dₐ / (dₐ − d_b)</code> で求まります。新しい頂点は位置だけでなく、
+法線・接線・UV も同じ <code>t</code> で線形補間して生成します(<code>Vertex.Lerp</code>)。
+補間した法線と接線は長さが 1 でなくなるため再正規化します。
+これにより切断後もシェーディングやテクスチャが元のメッシュと連続します。
+</p>
+
+<figure>
+<svg viewBox="0 0 720 210" role="img" aria-label="切断辺上での頂点属性の補間">
+  <line x1="308" y1="28" x2="308" y2="192" class="sp dash"/>
+  <text x="318" y="44" class="small tplane">切断平面</text>
+  <line x1="140" y1="145" x2="560" y2="75" class="sk"/>
+  <g class="narrow" transform="translate(140,145) rotate(-116)">
+    <line x1="6" y1="0" x2="36" y2="0"/><polygon points="45,0 34,-4.5 34,4.5"/>
+  </g>
+  <g class="narrow" transform="translate(560,75) rotate(-70)">
+    <line x1="6" y1="0" x2="36" y2="0"/><polygon points="45,0 34,-4.5 34,4.5"/>
+  </g>
+  <g class="narrow accent" transform="translate(308,117) rotate(-95)">
+    <line x1="6" y1="0" x2="36" y2="0"/><polygon points="45,0 34,-4.5 34,4.5"/>
+  </g>
+  <circle cx="140" cy="145" r="4" class="dot-ink"/>
+  <circle cx="560" cy="75" r="4" class="dot-ink"/>
+  <circle cx="308" cy="117" r="4.5" class="dot-plane"/>
+  <text x="140" y="172" class="mid tt">頂点 a</text>
+  <text x="140" y="190" class="mid small">位置・法線・接線・UV</text>
+  <text x="560" y="102" class="mid tt">頂点 b</text>
+  <text x="322" y="150" class="tplane">新頂点 = Lerp(a, b, t)</text>
+  <text x="322" y="169" class="small">法線・接線は再正規化</text>
+  <text x="322" y="188" class="mono">t = da / (da − db)</text>
+</svg>
+<figcaption><span class="figno">図 4</span>交点に生成される新頂点。
+細い矢印は各頂点の法線で、新頂点の法線(紫)は両端の法線を t で補間したもの。</figcaption>
+</figure>
+
+<!-- ================================================================ -->
+<h2><span class="no">5</span>キャップ(切断面)の生成</h2>
+
+<p>
+ここまでの処理で破片の「壁」はできますが、切り口は開いたままです。
+分割時に集めておいた<strong>切断線分</strong>(図 2・図 3 の太い線分)から、
+切り口の断面形状を復元して蓋を張ります。<code>CapBuilder</code> の仕事は次の 3 段階です。
+</p>
+
+<figure>
+<svg viewBox="0 0 760 280" role="img" aria-label="キャップ生成の 3 段階">
+  <!-- (a) collected segments -->
+  <g transform="translate(130,120)">
+    <line x1="81" y1="39" x2="39" y2="81" class="seg"/>
+    <line x1="29.4" y1="85" x2="-29.4" y2="85" class="seg"/>
+    <line x1="-39" y1="81" x2="-81" y2="39" class="seg"/>
+    <line x1="-85" y1="29.4" x2="-85" y2="-29.4" class="seg"/>
+    <line x1="-81" y1="-39" x2="-39" y2="-81" class="seg"/>
+    <line x1="-29.4" y1="-85" x2="29.4" y2="-85" class="seg"/>
+    <line x1="39" y1="-81" x2="81" y2="-39" class="seg"/>
+    <line x1="85" y1="-29.4" x2="85" y2="29.4" class="seg"/>
+    <line x1="29.4" y1="2.6" x2="2.6" y2="29.4" class="seg"/>
+    <line x1="-2.6" y1="29.4" x2="-29.4" y2="2.6" class="seg"/>
+    <line x1="-29.4" y1="-2.6" x2="-2.6" y2="-29.4" class="seg"/>
+    <line x1="2.6" y1="-29.4" x2="29.4" y2="-2.6" class="seg"/>
+  </g>
+  <!-- (b) chained loops -->
+  <g transform="translate(380,120)">
+    <polygon points="85,35 35,85 -35,85 -85,35 -85,-35 -35,-85 35,-85 85,-35" class="outline"/>
+    <polygon points="32,0 0,32 -32,0 0,-32" class="outline"/>
+    <line x1="12" y1="-85" x2="-6" y2="-85" class="sk"/>
+    <polygon points="-14,-85 -5,-89.5 -5,-80.5" class="dot-ink"/>
+    <line x1="-12" y1="85" x2="6" y2="85" class="sk"/>
+    <polygon points="14,85 5,80.5 5,89.5" class="dot-ink"/>
+    <g transform="translate(8,-24) rotate(45)">
+      <line x1="0" y1="0" x2="12" y2="0" class="sk"/>
+      <polygon points="19,0 10,-4.5 10,4.5" class="dot-ink"/>
+    </g>
+    <text x="0" y="-100" class="mid small">外周ループ</text>
+    <text x="0" y="5" class="mid small">穴</text>
+  </g>
+  <!-- (c) triangulated -->
+  <g transform="translate(630,120)">
+    <path d="M85,35 L35,85 L-35,85 L-85,35 L-85,-35 L-35,-85 L35,-85 L85,-35 Z
+             M32,0 L0,32 L-32,0 L0,-32 Z"
+          fill-rule="evenodd" fill="var(--pos)" fill-opacity=".09" stroke="none"/>
+    <line x1="85" y1="-35" x2="32" y2="0" class="thin"/>
+    <line x1="35" y1="85" x2="0" y2="32" class="thin"/>
+    <line x1="-35" y1="85" x2="0" y2="32" class="thin"/>
+    <line x1="-85" y1="35" x2="-32" y2="0" class="thin"/>
+    <line x1="-85" y1="-35" x2="-32" y2="0" class="thin"/>
+    <line x1="35" y1="-85" x2="0" y2="-32" class="thin"/>
+    <line x1="-35" y1="-85" x2="0" y2="-32" class="thin"/>
+    <line x1="85" y1="35" x2="0" y2="32" class="thin"/>
+    <line x1="-35" y1="85" x2="-32" y2="0" class="thin"/>
+    <line x1="-85" y1="-35" x2="0" y2="-32" class="thin"/>
+    <line x1="35" y1="-85" x2="32" y2="0" class="thin"/>
+    <polygon points="85,35 35,85 -35,85 -85,35 -85,-35 -35,-85 35,-85 85,-35" class="outline"/>
+    <polygon points="32,0 0,32 -32,0 0,-32" class="outline"/>
+    <line x1="32" y1="0" x2="85" y2="35" class="bridge"/>
+    <line x1="58" y1="46" x2="56" y2="24" class="leader"/>
+    <text x="58" y="62" class="mid small tplane">ブリッジ</text>
+  </g>
+  <text x="130" y="258" class="mid">① 線分を収集し端点を溶接</text>
+  <text x="380" y="258" class="mid">② 連結して閉ループ化</text>
+  <text x="630" y="258" class="mid">③ 穴をつないで三角形分割</text>
+</svg>
+<figcaption><span class="figno">図 5</span>断面がドーナツ状(穴あき)になる場合のキャップ生成。
+バラバラの線分をつなぐと外周ループと穴ループが得られ、穴はブリッジ辺(紫)で外周に
+接続してから 1 つの多角形として三角形分割する。</figcaption>
+</figure>
+
+<h3>① 端点の溶接と重複除去</h3>
+<p>
+各三角形から独立に生成された線分の端点は、浮動小数点誤差でごくわずかにずれています。
+そこで座標をモデルサイズ比 10⁻⁵ 程度のグリッドに量子化し、同じセルに落ちた端点を
+同一の点として<strong>溶接</strong>(weld)します。また、平面上に乗った辺は隣接する
+2 つの三角形の両方から同じ線分として報告されるため、重複した線分は除去します。
+</p>
+
+<h3>② 閉ループへの連結</h3>
+<p>
+溶接後の線分は端点を共有するチェーンになっているので、端から順にたどって
+<strong>閉ループ</strong>に連結します。水密なメッシュを平面で切った断面は、
+必ず 1 つ以上の閉じた輪郭(外周のみ、または外周+穴)になります。
+</p>
+
+<h3>③ 2D 投影と三角形分割</h3>
+<p>
+ループ上の点を平面上の 2 軸 (u, v) に投影して 2D 多角形にします
+(数値誤差対策として単位サイズに正規化もします)。その後の三角形分割は
+<code>PolygonTriangulator</code> が担当します。
+</p>
+<ul>
+  <li><strong>外周と穴の判定</strong> — 各ループが他のいくつのループに含まれるかを数え、
+      偶数重なら外周(ソリッド)、奇数重なら穴と判定します(even-odd 規則)。
+      これによりドーナツ状や入れ子の断面も正しく扱えます。</li>
+  <li><strong>穴のブリッジ</strong> — 穴ループは、互いに見通せる頂点のペアを見つけて
+      外周へ<strong>ブリッジ辺</strong>でつなぎ、穴のない 1 本の多角形に変形します
+      (図 5 ③ の紫の辺。行き帰り 2 重の辺として挿入されます)。</li>
+  <li><strong>耳切り法(ear clipping)</strong> — 凸な角から順に三角形を切り落として
+      いく古典的な方法で多角形全体を三角形化します。</li>
+</ul>
+
+<h3>キャップを両側の破片へ追加</h3>
+<p>
+得られた三角形群は、<strong>同じ形状のまま両方の破片</strong>に追加されます。
+ただし向きが逆になります。<span class="term-pos">Positive</span> 側の破片から見ると
+切り口は法線と反対の方向を向くため、キャップの法線は −n、巻き順も反転。
+<span class="term-neg">Negative</span> 側は法線 +n でそのまま、という対応です(図 1 参照)。
+キャップの頂点には平面内の軸から作った接線と、UV = (0, 0) が割り当てられます。
+</p>
+
+<!-- ================================================================ -->
+<h2><span class="no">6</span>切断面のオフセット — 縮退の回避</h2>
+
+<p>
+ここまでの手順は、平面が三角形の辺を「きれいに横断」している限り正しく動きます。
+ところが平面が<strong>ちょうど頂点の上や辺の上を通る</strong>と話が変わります。
+交線が 1 点に潰れたり、線分が途切れたり分岐したりして、切断境界が閉ループに
+ならなくなるのです。境界が閉じていないと三角形分割が破綻し、
+<strong>キャップに穴が空く</strong>などの破損が起きます。
+</p>
+
+<figure>
+<svg viewBox="0 0 720 250" role="img" aria-label="平面が頂点を通る縮退と、オフセットによる回避">
+  <!-- left: degenerate -->
+  <g transform="translate(20,20)">
+    <line x1="0" y1="140" x2="310" y2="140" class="sp dash"/>
+    <polyline points="20,60 90,140 160,70 230,150 290,95" class="sk"/>
+    <circle cx="221" cy="140" r="3.5" class="dot-plane"/>
+    <circle cx="90" cy="140" r="3.5" class="dot-bad"/>
+    <circle cx="90" cy="140" r="8" class="ring-bad"/>
+    <line x1="86" y1="150" x2="72" y2="180" class="leader"/>
+    <text x="70" y="198" class="mid small tbad">頂点がちょうど平面上</text>
+  </g>
+  <!-- right: nudged -->
+  <g transform="translate(390,20)">
+    <line x1="0" y1="140" x2="310" y2="140" class="sp dash faint"/>
+    <line x1="0" y1="120" x2="310" y2="120" class="sp dash"/>
+    <polyline points="20,60 90,140 160,70 230,150 290,95" class="sk"/>
+    <circle cx="72" cy="120" r="3.5" class="dot-plane"/>
+    <circle cx="110" cy="120" r="3.5" class="dot-plane"/>
+    <circle cx="204" cy="120" r="3.5" class="dot-plane"/>
+    <circle cx="263" cy="120" r="3.5" class="dot-plane"/>
+    <line x1="14" y1="138" x2="14" y2="126" class="sp"/>
+    <polygon points="14,118 9.5,127 18.5,127" class="fp"/>
+    <text x="24" y="132" class="small tplane">m·ε 移動</text>
+  </g>
+  <text x="175" y="236" class="mid">頂点を通ると交線が退化する</text>
+  <text x="545" y="236" class="mid">少しずらせばすべて横断交差になる</text>
+</svg>
+<figcaption><span class="figno">図 6</span>縮退とその回避(メッシュの側面図)。
+左: 平面(点線)がメッシュの頂点をちょうど通り、交差が壊れる。
+右: 平面を法線方向に m·ε だけずらすと、すべての交差が通常の横断交差になる。</figcaption>
+</figure>
+
+<p>
+そこで MeshSlicer は、本番の切断を行う前に切断位置を<strong>プローブ</strong>(下見)します。
+切断線分の収集だけを軽量に実行し(クリップやメッシュ構築はしない)、
+溶接後の境界グラフを検査するのです。判定基準はシンプルで、
+<strong>すべての点の次数(接続する線分の数)がちょうど 2</strong> であること。
+これは境界が単純な閉ループの集まりであることと同値です。
+</p>
+
+<figure>
+<svg viewBox="0 0 720 262" role="img" aria-label="境界グラフの次数チェックとオフセット探索のステップ">
+  <!-- degree examples -->
+  <g transform="translate(140,72)">
+    <polyline points="-52,22 -10,-14 36,6" class="sk"/>
+    <circle cx="36" cy="6" r="4.5" class="dot-bad"/>
+    <text x="52" y="-8" class="tbad">✕</text>
+    <text x="0" y="58" class="mid small">次数 1(途切れ)</text>
+  </g>
+  <g transform="translate(360,72)">
+    <polygon points="0,-30 28.5,-9.3 17.6,24.3 -17.6,24.3 -28.5,-9.3" class="outline"/>
+    <circle cx="0" cy="-30" r="3.5" class="dot-pos"/>
+    <circle cx="28.5" cy="-9.3" r="3.5" class="dot-pos"/>
+    <circle cx="17.6" cy="24.3" r="3.5" class="dot-pos"/>
+    <circle cx="-17.6" cy="24.3" r="3.5" class="dot-pos"/>
+    <circle cx="-28.5" cy="-9.3" r="3.5" class="dot-pos"/>
+    <text x="42" y="-22" class="tpos">✓</text>
+    <text x="0" y="58" class="mid small">次数 2(閉ループ)</text>
+  </g>
+  <g transform="translate(580,72)">
+    <line x1="0" y1="0" x2="-38" y2="-26" class="sk"/>
+    <line x1="0" y1="0" x2="38" y2="-26" class="sk"/>
+    <line x1="0" y1="0" x2="0" y2="34" class="sk"/>
+    <circle cx="0" cy="0" r="4.5" class="dot-bad"/>
+    <text x="52" y="-16" class="tbad">✕</text>
+    <text x="0" y="58" class="mid small">次数 3(分岐)</text>
+  </g>
+  <text x="360" y="158" class="mid">境界のすべての点が次数 2 になるまで、平面を ε 単位でずらして再プローブ</text>
+  <!-- nudge ruler -->
+  <line x1="80" y1="205" x2="645" y2="205" class="axis"/>
+  <line x1="360" y1="196" x2="360" y2="214" class="tick0"/>
+  <line x1="378" y1="199" x2="378" y2="211" class="tick"/>
+  <line x1="342" y1="199" x2="342" y2="211" class="tick"/>
+  <line x1="391" y1="199" x2="391" y2="211" class="tick"/>
+  <line x1="329" y1="199" x2="329" y2="211" class="tick"/>
+  <line x1="411" y1="199" x2="411" y2="211" class="tick"/>
+  <line x1="309" y1="199" x2="309" y2="211" class="tick"/>
+  <line x1="448" y1="199" x2="448" y2="211" class="tick"/>
+  <line x1="272" y1="199" x2="272" y2="211" class="tick"/>
+  <line x1="513" y1="199" x2="513" y2="211" class="tick"/>
+  <line x1="207" y1="199" x2="207" y2="211" class="tick"/>
+  <line x1="624" y1="199" x2="624" y2="211" class="tick"/>
+  <line x1="96" y1="199" x2="96" y2="211" class="tick"/>
+  <!-- tick labels (two rows) -->
+  <text x="378" y="178" class="mid small mono">+ε</text>
+  <text x="342" y="178" class="mid small mono">−ε</text>
+  <text x="411" y="178" class="mid small mono">+8ε</text>
+  <text x="309" y="178" class="mid small mono">−8ε</text>
+  <text x="513" y="178" class="mid small mono">+72ε</text>
+  <text x="207" y="178" class="mid small mono">−72ε</text>
+  <text x="360" y="192" class="mid small mono">0</text>
+  <text x="391" y="192" class="mid small mono">+3ε</text>
+  <text x="329" y="192" class="mid small mono">−3ε</text>
+  <text x="448" y="192" class="mid small mono">+24ε</text>
+  <text x="272" y="192" class="mid small mono">−24ε</text>
+  <text x="624" y="192" class="mid small mono">+216ε</text>
+  <text x="96" y="192" class="mid small mono">−216ε</text>
+  <!-- try order -->
+  <text x="360" y="228" class="mid small mono">1</text>
+  <text x="378" y="228" class="mid small mono">2</text>
+  <text x="342" y="228" class="mid small mono">3</text>
+  <text x="391" y="228" class="mid small mono">4</text>
+  <text x="329" y="228" class="mid small mono">5</text>
+  <text x="411" y="228" class="mid small mono">6</text>
+  <text x="309" y="228" class="mid small mono">7</text>
+  <text x="448" y="228" class="mid small mono">8</text>
+  <text x="272" y="228" class="mid small mono">9</text>
+  <text x="513" y="228" class="mid small mono">10</text>
+  <text x="207" y="228" class="mid small mono">11</text>
+  <text x="624" y="228" class="mid small mono">12</text>
+  <text x="96" y="228" class="mid small mono">13</text>
+  <text x="360" y="250" class="mid small">下段の数字は試行順。0 から始めて両側交互に、段階的にオフセットを広げる</text>
+</svg>
+<figcaption><span class="figno">図 7</span>上: プローブによる境界グラフの健全性チェック。
+次数 1(途切れ)や次数 3 以上(分岐)の点が 1 つでもあれば、その切断位置は不採用。
+下: オフセット候補の探索列。刻みは対数的に広がる(目盛は模式図)。</figcaption>
+</figure>
+
+<p>
+プローブに失敗した場合は、平面を法線方向に <code>m × ε</code> だけずらして再試行します。
+候補となる倍率 <code>m</code> は次の通りで、0 から始めて両側へ交互に、段階的に広げていきます。
+</p>
+
+<pre><code>// 縮退時に試すオフセット量(ε 単位)。両側・段階的に拡大していく
+static readonly float[] NudgeSteps = { 0, 1, -1, 3, -3, 8, -8, 24, -24, 72, -72, 216, -216 };</code></pre>
+
+<p>
+最大の 216ε でもモデルサイズの約 2% にすぎないため、切断位置の変化は見た目には
+ほぼ分かりません。ほとんどのケースは最初の 1〜2 ステップで解決します。
+プローブは線分収集だけの軽い O(三角形数) パスなので、縮退のない通常の切断で
+追加されるコストはわずかです。また、プローブと本番の切断は交線の計算コード
+(<code>TryCutSegment</code>)を共有しているため、「プローブで合格した境界」と
+「実際に切断したときの境界」が食い違うことはありません。
+すべての候補が失敗した場合は、元の位置でベストエフォートの切断にフォールバックします。
+</p>
+
+<!-- ================================================================ -->
+<h2><span class="no">7</span>まとめ — ソースコードとの対応</h2>
+
+<p>
+以上をまとめると、MeshSlicer の切断は「符号付き距離で三角形を仕分けし、
+またぐものだけをクリップで分割、切り口の線分を閉ループに組み立てて蓋をする」
+という流れです。数値誤差への備えとして、平面近傍の頂点の 0 スナップ(ε)、
+端点の量子化溶接、そして切断位置そのもののオフセット探索という
+3 段階の防御が入っています。
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr><th>ファイル</th><th>役割</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>Slicer.cs</code></td>
+        <td>エントリポイント。距離計算、オフセット探索、三角形の分類とクリップ、全体の組み立て</td></tr>
+    <tr><td><code>Vertex.cs</code></td>
+        <td>位置・法線・接線・UV を持つ頂点と、その線形補間(<code>Lerp</code>)</td></tr>
+    <tr><td><code>CapBuilder.cs</code></td>
+        <td>切断線分の収集・溶接・ループ化、2D 投影、境界グラフの次数チェック</td></tr>
+    <tr><td><code>PolygonTriangulator.cs</code></td>
+        <td>穴あき多角形の三角形分割(外周/穴の判定、ブリッジ、耳切り法)</td></tr>
+    <tr><td><code>MeshBuilder.cs</code></td>
+        <td>三角形を蓄積して <code>Mesh</code> に変換</td></tr>
+    <tr><td><code>SliceResult.cs</code></td>
+        <td>結果(Positive / Negative の 2 メッシュ)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>
+入力の前提は<strong>水密(2-manifold)なメッシュ</strong>であることです。
+開いたメッシュや自己交差のあるメッシュでは切断境界が閉ループにならないため、
+キャップが正しく張れないことがあります(壁の分割自体は動作します)。
+</p>
+
+<footer>
+MeshSlicer — Assets/MeshSlicer/Runtime のアルゴリズム解説(2026-07)。
+Burst 実装(BurstSlicer.cs)は同じアルゴリズムの高速化版であり、本稿の範囲外。
+</footer>
+</main>
+</html>

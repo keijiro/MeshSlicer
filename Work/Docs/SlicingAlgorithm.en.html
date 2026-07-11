@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeshSlicer Algorithm Notes</title>
+<style>
+:root {
+  --bg: #F4F6F5;
+  --panel: #FFFFFF;
+  --shape: #EBF0EE;
+  --ink: #242B30;
+  --muted: #5D6871;
+  --line: #D8DEDB;
+  --code-bg: #ECEFED;
+  --plane: #6A58C8;
+  --pos: #0E8577;
+  --neg: #C2691F;
+  --bad: #C4473F;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181C;
+    --panel: #1C2126;
+    --shape: #262D33;
+    --ink: #E2E7EA;
+    --muted: #97A2AB;
+    --line: #333B42;
+    --code-bg: #232A30;
+    --plane: #A294F0;
+    --pos: #3CBFAD;
+    --neg: #E8935A;
+    --bad: #E5675F;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14181C;
+  --panel: #1C2126;
+  --shape: #262D33;
+  --ink: #E2E7EA;
+  --muted: #97A2AB;
+  --line: #333B42;
+  --code-bg: #232A30;
+  --plane: #A294F0;
+  --pos: #3CBFAD;
+  --neg: #E8935A;
+  --bad: #E5675F;
+}
+:root[data-theme="light"] {
+  --bg: #F4F6F5;
+  --panel: #FFFFFF;
+  --shape: #EBF0EE;
+  --ink: #242B30;
+  --muted: #5D6871;
+  --line: #D8DEDB;
+  --code-bg: #ECEFED;
+  --plane: #6A58C8;
+  --pos: #0E8577;
+  --neg: #C2691F;
+  --bad: #C4473F;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-size: 15.5px;
+  line-height: 1.8;
+  margin: 0;
+}
+main {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 56px 24px 96px;
+}
+
+/* ---- header ---- */
+.eyebrow {
+  font-size: 12.5px;
+  letter-spacing: .14em;
+  color: var(--plane);
+  font-weight: 600;
+  margin: 0 0 14px;
+}
+h1 {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 33px;
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 0 0 6px;
+  text-wrap: balance;
+}
+.subtitle {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 17px;
+  color: var(--muted);
+  margin: 0 0 26px;
+}
+.lede {
+  font-size: 16px;
+  border-left: 3px solid var(--plane);
+  padding-left: 18px;
+  margin: 0 0 10px;
+}
+.meta {
+  font-size: 12.5px;
+  color: var(--muted);
+  margin: 18px 0 0;
+}
+.meta code { font-size: 12px; }
+
+/* ---- sections ---- */
+h2 {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  font-size: 21px;
+  line-height: 1.5;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+  margin: 64px 0 22px;
+}
+h2 .no {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 27px;
+  font-weight: 600;
+  color: var(--plane);
+  min-width: 1em;
+}
+h3 {
+  font-size: 16.5px;
+  margin: 36px 0 12px;
+}
+p { margin: 0 0 18px; }
+ul, ol { margin: 0 0 18px; padding-left: 1.6em; }
+li { margin-bottom: 6px; }
+strong { font-weight: 600; }
+em { font-style: normal; font-weight: 600; color: var(--plane); }
+
+code, pre {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+code {
+  background: var(--code-bg);
+  border-radius: 3px;
+  padding: .12em .38em;
+  font-size: .86em;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 16px 18px;
+  font-size: 13px;
+  line-height: 1.75;
+  overflow-x: auto;
+  margin: 0 0 18px;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+
+.term-pos { color: var(--pos); font-weight: 600; }
+.term-neg { color: var(--neg); font-weight: 600; }
+.term-plane { color: var(--plane); font-weight: 600; }
+
+/* ---- pipeline ---- */
+.pipeline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 8px;
+  margin: 26px 0;
+}
+.pl-step {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 7px 13px 7px 9px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.pl-step .n {
+  font-family: Georgia, "Times New Roman", serif;
+  color: var(--plane);
+  font-weight: 600;
+  font-size: 14px;
+}
+.pl-arr { color: var(--muted); font-size: 13px; }
+
+/* ---- figures ---- */
+figure {
+  margin: 30px 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 20px 16px 10px;
+}
+figure svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+figcaption {
+  border-top: 1px dashed var(--line);
+  margin-top: 12px;
+  padding: 10px 6px 6px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+.figno { color: var(--plane); font-weight: 600; font-style: normal; margin-right: .6em; }
+
+/* ---- SVG classes ---- */
+svg text { font-family: inherit; font-size: 12.5px; fill: var(--muted); }
+svg .tt { fill: var(--ink); font-weight: 600; }
+svg .tpos { fill: var(--pos); font-weight: 600; }
+svg .tneg { fill: var(--neg); font-weight: 600; }
+svg .tplane { fill: var(--plane); font-weight: 600; }
+svg .tbad { fill: var(--bad); font-weight: 600; }
+svg .small { font-size: 11px; }
+svg .mid { text-anchor: middle; }
+svg .end { text-anchor: end; }
+svg .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; }
+
+svg .shape { fill: var(--shape); stroke: var(--ink); stroke-width: 1.6; }
+svg .outline { fill: none; stroke: var(--ink); stroke-width: 1.7; }
+svg .sk { stroke: var(--ink); stroke-width: 1.8; fill: none; }
+svg .sp { stroke: var(--plane); stroke-width: 1.6; fill: none; }
+svg .fp { fill: var(--plane); }
+svg .dash { stroke-dasharray: 7 5; }
+svg .faint { opacity: .32; }
+svg .planeface { fill: var(--plane); fill-opacity: .08; stroke: var(--plane); stroke-width: 1.4; stroke-dasharray: 7 5; }
+svg .planeband { fill: var(--plane); fill-opacity: .09; }
+svg .tri-pos { fill: var(--pos); fill-opacity: .12; stroke: var(--pos); stroke-width: 1.7; }
+svg .tri-neg { fill: var(--neg); fill-opacity: .12; stroke: var(--neg); stroke-width: 1.7; }
+svg .cap-pos { fill: var(--pos); fill-opacity: .18; stroke: var(--pos); stroke-width: 1.6; }
+svg .cap-neg { fill: var(--neg); fill-opacity: .18; stroke: var(--neg); stroke-width: 1.6; }
+svg .dot-pos { fill: var(--pos); }
+svg .dot-neg { fill: var(--neg); }
+svg .dot-plane { fill: var(--plane); }
+svg .dot-ink { fill: var(--ink); }
+svg .dot-bad { fill: var(--bad); }
+svg .ring-bad { fill: none; stroke: var(--bad); stroke-width: 2; }
+svg .cutseg { stroke: var(--plane); stroke-width: 3.4; stroke-linecap: round; }
+svg .seg { stroke: var(--ink); stroke-width: 2.4; stroke-linecap: round; fill: none; }
+svg .thin { stroke: var(--muted); stroke-width: 1; opacity: .6; }
+svg .bridge { stroke: var(--plane); stroke-width: 3.2; stroke-linecap: round; }
+svg .leader { stroke: var(--muted); stroke-width: 1; }
+svg .narrow line { stroke: var(--muted); stroke-width: 2; }
+svg .narrow polygon { fill: var(--muted); }
+svg .narrow.accent line { stroke: var(--plane); }
+svg .narrow.accent polygon { fill: var(--plane); }
+svg .axis { stroke: var(--muted); stroke-width: 1.3; }
+svg .tick { stroke: var(--muted); stroke-width: 1.3; }
+svg .tick0 { stroke: var(--ink); stroke-width: 1.8; }
+
+/* ---- table ---- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  margin: 0 0 18px;
+}
+th, td {
+  text-align: left;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+th {
+  font-size: 12px;
+  letter-spacing: .06em;
+  color: var(--muted);
+  font-weight: 600;
+}
+td code { white-space: nowrap; }
+.table-wrap { overflow-x: auto; }
+
+footer {
+  margin-top: 72px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+  font-size: 12.5px;
+  color: var(--muted);
+}
+</style>
+
+<main>
+<p class="eyebrow">MESHSLICER / RUNTIME — ALGORITHM NOTES</p>
+<h1>How Plane-Based Mesh Slicing Works</h1>
+<p class="subtitle">From triangle classification and clipping to cap generation</p>
+
+<p class="lede">
+MeshSlicer is a library that cuts a watertight (2-manifold) mesh with an infinite plane
+and returns two closed meshes, each sealed with a cap over the cut cross section.
+This document walks through what <code>Slicer.Slice(Mesh, Plane)</code> does internally,
+following the order of the pipeline.
+</p>
+<p class="meta">
+Covered code: <code>Assets/MeshSlicer/Runtime/</code> (Slicer.cs / Vertex.cs / CapBuilder.cs /
+PolygonTriangulator.cs and friends). The Burst-accelerated implementation (BurstSlicer.cs)
+is out of scope here.
+</p>
+
+<!-- ================================================================ -->
+<h2><span class="no">1</span>Input and Output</h2>
+
+<p>
+The input is a <code>Mesh</code> to cut and a plane (normal <code>n</code> and distance
+<code>d</code>) defined in the mesh's local space. The output is a <code>SliceResult</code>
+holding two meshes: <span class="term-pos">Positive</span>, the piece on the side the
+normal points to, and <span class="term-neg">Negative</span>, the piece on the other side.
+If the whole mesh lies on one side, the other piece is <code>null</code>.
+</p>
+
+<figure>
+<svg viewBox="0 0 720 290" role="img" aria-label="A sphere cut by a plane, producing two capped pieces">
+  <!-- source mesh -->
+  <g transform="translate(130,140)">
+    <circle r="80" class="shape"/>
+    <ellipse cy="20" rx="110" ry="22" class="planeface"/>
+    <line x1="95" y1="20" x2="95" y2="-38" class="sp"/>
+    <polygon points="95,-48 90,-37 100,-37" class="fp"/>
+    <text x="104" y="-34">normal n</text>
+    <text x="-114" y="50" class="tplane">slice</text>
+    <text x="-114" y="66" class="tplane">plane</text>
+    <text y="112" class="mid">source mesh (watertight)</text>
+  </g>
+  <!-- arrow -->
+  <line x1="283" y1="140" x2="345" y2="140" class="sk"/>
+  <polygon points="355,140 344,135 344,145" class="dot-ink"/>
+  <text x="318" y="126" class="mid mono">Slice()</text>
+  <!-- result -->
+  <g transform="translate(520,140)">
+    <path d="M -77.5,-15 A 80 80 0 1 1 77.5,-15 Z" class="shape"/>
+    <ellipse cy="-15" rx="77.5" ry="16" class="cap-pos"/>
+    <path d="M -77.5,75 A 80 80 0 0 0 77.5,75 Z" class="shape"/>
+    <ellipse cy="75" rx="77.5" ry="16" class="cap-neg"/>
+    <text x="92" y="-44" class="tpos">Positive</text>
+    <text x="92" y="-27" class="small">side n points to</text>
+    <text x="92" y="70" class="tneg">Negative</text>
+    <text x="92" y="87" class="small">other side</text>
+    <text x="-98" y="36" class="end">caps</text>
+    <line x1="-94" y1="26" x2="-72" y2="-10" class="leader"/>
+    <line x1="-94" y1="34" x2="-74" y2="66" class="leader"/>
+  </g>
+</svg>
+<figcaption><span class="figno">Fig. 1</span>Input and output of a slice. Both pieces come
+back as closed meshes whose cut faces are sealed with caps. The Positive piece's cap faces
+−n; the Negative piece's cap faces +n.</figcaption>
+</figure>
+
+<!-- ================================================================ -->
+<h2><span class="no">2</span>Pipeline Overview</h2>
+
+<p>The whole process runs in six stages:</p>
+
+<div class="pipeline">
+  <div class="pl-step"><span class="n">1</span>Signed vertex distances</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">2</span>Probe &amp; offset the cut position</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">3</span>Classify &amp; split triangles</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">4</span>Collect cut segments</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">5</span>Chain loops &amp; triangulate</div>
+  <span class="pl-arr">→</span>
+  <div class="pl-step"><span class="n">6</span>Add caps to both pieces</div>
+</div>
+
+<p>
+Stages 3–6 are the core: cut every triangle against the plane and seal the openings.
+Stage 2 — the "offset" — is a preprocessing step that avoids <strong>degenerate cases</strong>
+where the plane passes exactly through vertices or edges; it is covered in detail
+in Section 6.
+</p>
+
+<!-- ================================================================ -->
+<h2><span class="no">3</span>Classifying Vertices by Signed Distance</h2>
+
+<p>
+First, every vertex gets a <strong>signed distance</strong> to the plane,
+<code>d = dot(n, p) + plane.d</code>: positive means the normal side, negative the other side.
+The raw value is not used directly, though — a vertex very close to the plane
+(within a tolerance <em>ε</em>) has its distance snapped to 0 and is treated as
+<strong>lying on the plane</strong>.
+</p>
+
+<pre><code>static float SignedDist(float3 p, float3 n, float d, float eps)
+{
+    var s = math.dot(n, p) + d;
+    return math.abs(s) &lt;= eps ? 0f : s;   // snap near-plane vertices onto the plane
+}</code></pre>
+
+<p>
+<em>ε</em> scales with the model
+(<code>ε = max(largest bounding-box dimension × 10⁻⁴, 10⁻⁶)</code>).
+It keeps vertices that would otherwise flip between "barely positive" and "barely negative"
+due to floating-point error consistently classified as on-plane.
+</p>
+
+<p>Each triangle is then sorted into one of three cases by the signs of its three vertices:</p>
+
+<figure>
+<svg viewBox="0 0 720 252" role="img" aria-label="The three classifications of a triangle against the plane">
+  <!-- eps band + plane -->
+  <rect x="20" y="132" width="680" height="16" class="planeband"/>
+  <line x1="20" y1="140" x2="700" y2="140" class="sp dash"/>
+  <!-- normal arrow -->
+  <line x1="44" y1="126" x2="44" y2="88" class="sp"/>
+  <polygon points="44,79 39,89 49,89" class="fp"/>
+  <text x="54" y="94">n</text>
+  <text x="24" y="168" class="small">±ε band → treated as d = 0</text>
+  <text x="700" y="118" class="end small">d &gt; 0 side</text>
+  <text x="700" y="166" class="end small">d &lt; 0 side</text>
+  <!-- T1 all positive -->
+  <polygon points="140,45 205,85 120,105" class="tri-pos"/>
+  <circle cx="140" cy="45" r="3.5" class="dot-pos"/>
+  <circle cx="205" cy="85" r="3.5" class="dot-pos"/>
+  <circle cx="120" cy="105" r="3.5" class="dot-pos"/>
+  <text x="160" y="240" class="mid">all d ≥ 0 → <tspan class="tpos">Positive</tspan></text>
+  <!-- T2 straddle -->
+  <polygon points="340,70 430,95 370,205" class="outline"/>
+  <line x1="356" y1="140" x2="405" y2="140" class="cutseg"/>
+  <circle cx="340" cy="70" r="3.5" class="dot-pos"/>
+  <circle cx="430" cy="95" r="3.5" class="dot-pos"/>
+  <circle cx="370" cy="205" r="3.5" class="dot-neg"/>
+  <text x="330" y="63" class="end small mono">d&gt;0</text>
+  <text x="440" y="91" class="small mono">d&gt;0</text>
+  <text x="381" y="213" class="small mono">d&lt;0</text>
+  <text x="385" y="240" class="mid">mixed signs → <tspan class="tplane">split</tspan></text>
+  <!-- T3 all negative -->
+  <polygon points="560,165 640,180 585,225" class="tri-neg"/>
+  <circle cx="560" cy="165" r="3.5" class="dot-neg"/>
+  <circle cx="640" cy="180" r="3.5" class="dot-neg"/>
+  <circle cx="585" cy="225" r="3.5" class="dot-neg"/>
+  <text x="600" y="240" class="mid">all d ≤ 0 → <tspan class="tneg">Negative</tspan></text>
+</svg>
+<figcaption><span class="figno">Fig. 2</span>Triangle classification. A triangle entirely on
+one side is copied to that piece as-is; only triangles with mixed signs get split. The thick
+segment in the middle is the triangle–plane intersection, which feeds cap generation
+(Section 5).</figcaption>
+</figure>
+
+<ul>
+  <li>All <code>d ≥ 0</code> — copied straight to the <span class="term-pos">Positive</span> piece</li>
+  <li>All <code>d ≤ 0</code> — copied straight to the <span class="term-neg">Negative</span> piece</li>
+  <li>Mixed positive and negative — the triangle straddles the plane and gets <strong>split</strong> (next section)</li>
+  <li>All three <code>d = 0</code> (a face coplanar with the plane) — a zero-thickness degenerate face, discarded</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2><span class="no">4</span>Splitting Straddling Triangles</h2>
+
+<p>
+A straddling triangle is clipped against each of the two half-spaces using the
+<strong>Sutherland–Hodgman algorithm</strong>. Walking the three edges in order with the
+rule "output inside vertices as-is; insert an intersection point where an edge crosses
+the plane" yields a convex polygon on each side — either a triangle or a quad.
+A quad is then fanned into two triangles.
+</p>
+
+<figure>
+<svg viewBox="0 0 720 300" role="img" aria-label="Clipping a straddling triangle and the resulting split">
+  <text x="185" y="26" class="mid tt">Before</text>
+  <text x="545" y="26" class="mid tt">After</text>
+  <!-- left: original -->
+  <line x1="50" y1="150" x2="310" y2="150" class="sp dash"/>
+  <text x="56" y="136" class="small">d &gt; 0</text>
+  <text x="56" y="174" class="small">d &lt; 0</text>
+  <polygon points="120,60 250,100 160,230" class="outline"/>
+  <line x1="141" y1="150" x2="215" y2="150" class="cutseg"/>
+  <circle cx="120" cy="60" r="4" class="dot-pos"/>
+  <circle cx="250" cy="100" r="4" class="dot-pos"/>
+  <circle cx="160" cy="230" r="4" class="dot-neg"/>
+  <circle cx="141" cy="150" r="4.5" class="dot-plane"/>
+  <circle cx="215" cy="150" r="4.5" class="dot-plane"/>
+  <text x="112" y="52" class="end tt">a</text>
+  <text x="259" y="97" class="tt">b</text>
+  <text x="160" y="248" class="mid tt">c</text>
+  <text x="133" y="170" class="end tplane">p₀</text>
+  <text x="224" y="170" class="tplane">p₁</text>
+  <line x1="220" y1="157" x2="243" y2="200" class="leader"/>
+  <text x="236" y="218" class="small">cut segment p₀–p₁</text>
+  <text x="236" y="235" class="small">goes to the cap builder</text>
+  <!-- right: result -->
+  <polygon points="500,40 630,80 595,130 521,130" class="tri-pos"/>
+  <line x1="500" y1="40" x2="595" y2="130" class="sp dash" opacity=".6"/>
+  <polygon points="521,175 595,175 540,255" class="tri-neg"/>
+  <text x="488" y="46" class="end tpos">Positive side</text>
+  <text x="488" y="64" class="end small">quad → fanned into 2</text>
+  <text x="509" y="198" class="end tneg">Negative side</text>
+  <text x="509" y="216" class="end small">stays a triangle</text>
+</svg>
+<figcaption><span class="figno">Fig. 3</span>Vertices a and b on the positive side, c on the
+negative side. Intersection points p₀ and p₁ appear on edges b–c and c–a; the positive side
+becomes the quad (a, b, p₁, p₀) and the negative side the triangle (p₀, p₁, c). The quad is
+split in two along the dotted diagonal.</figcaption>
+</figure>
+
+<p>
+One important detail: vertices with <code>d = 0</code> (on the plane) are included in
+<strong>both</strong> output polygons. This is what lets a triangle with a vertex sitting
+on the plane split cleanly into two pieces with no gap.
+</p>
+
+<h3>Interpolating vertex attributes at intersections</h3>
+
+<p>
+The intersection point along an edge comes from the ratio of the two signed distances,
+<code>t = dₐ / (dₐ − d_b)</code>. The new vertex interpolates not just position but also
+the normal, tangent, and UV with the same <code>t</code> (<code>Vertex.Lerp</code>).
+Interpolated normals and tangents lose unit length, so they are renormalized.
+This keeps shading and texturing continuous with the original mesh across the cut.
+</p>
+
+<figure>
+<svg viewBox="0 0 720 210" role="img" aria-label="Interpolating vertex attributes along a cut edge">
+  <line x1="308" y1="28" x2="308" y2="192" class="sp dash"/>
+  <text x="318" y="44" class="small tplane">slice plane</text>
+  <line x1="140" y1="145" x2="560" y2="75" class="sk"/>
+  <g class="narrow" transform="translate(140,145) rotate(-116)">
+    <line x1="6" y1="0" x2="36" y2="0"/><polygon points="45,0 34,-4.5 34,4.5"/>
+  </g>
+  <g class="narrow" transform="translate(560,75) rotate(-70)">
+    <line x1="6" y1="0" x2="36" y2="0"/><polygon points="45,0 34,-4.5 34,4.5"/>
+  </g>
+  <g class="narrow accent" transform="translate(308,117) rotate(-95)">
+    <line x1="6" y1="0" x2="36" y2="0"/><polygon points="45,0 34,-4.5 34,4.5"/>
+  </g>
+  <circle cx="140" cy="145" r="4" class="dot-ink"/>
+  <circle cx="560" cy="75" r="4" class="dot-ink"/>
+  <circle cx="308" cy="117" r="4.5" class="dot-plane"/>
+  <text x="140" y="172" class="mid tt">vertex a</text>
+  <text x="140" y="190" class="mid small">position · normal · tangent · UV</text>
+  <text x="560" y="102" class="mid tt">vertex b</text>
+  <text x="322" y="150" class="tplane">new vertex = Lerp(a, b, t)</text>
+  <text x="322" y="169" class="small">normal &amp; tangent renormalized</text>
+  <text x="322" y="188" class="mono">t = da / (da − db)</text>
+</svg>
+<figcaption><span class="figno">Fig. 4</span>The new vertex created at an intersection.
+Thin arrows are vertex normals; the new vertex's normal (purple) is the two endpoint
+normals blended by t.</figcaption>
+</figure>
+
+<!-- ================================================================ -->
+<h2><span class="no">5</span>Building the Cap (Cut Cross Section)</h2>
+
+<p>
+The steps so far produce the "walls" of each piece, but the cut faces are still open.
+The <strong>cut segments</strong> gathered during splitting (the thick segments in
+Figs. 2 and 3) are used to reconstruct the cross-section outline and seal it.
+<code>CapBuilder</code> does this in three stages:
+</p>
+
+<figure>
+<svg viewBox="0 0 760 280" role="img" aria-label="The three stages of cap generation">
+  <!-- (a) collected segments -->
+  <g transform="translate(130,120)">
+    <line x1="81" y1="39" x2="39" y2="81" class="seg"/>
+    <line x1="29.4" y1="85" x2="-29.4" y2="85" class="seg"/>
+    <line x1="-39" y1="81" x2="-81" y2="39" class="seg"/>
+    <line x1="-85" y1="29.4" x2="-85" y2="-29.4" class="seg"/>
+    <line x1="-81" y1="-39" x2="-39" y2="-81" class="seg"/>
+    <line x1="-29.4" y1="-85" x2="29.4" y2="-85" class="seg"/>
+    <line x1="39" y1="-81" x2="81" y2="-39" class="seg"/>
+    <line x1="85" y1="-29.4" x2="85" y2="29.4" class="seg"/>
+    <line x1="29.4" y1="2.6" x2="2.6" y2="29.4" class="seg"/>
+    <line x1="-2.6" y1="29.4" x2="-29.4" y2="2.6" class="seg"/>
+    <line x1="-29.4" y1="-2.6" x2="-2.6" y2="-29.4" class="seg"/>
+    <line x1="2.6" y1="-29.4" x2="29.4" y2="-2.6" class="seg"/>
+  </g>
+  <!-- (b) chained loops -->
+  <g transform="translate(380,120)">
+    <polygon points="85,35 35,85 -35,85 -85,35 -85,-35 -35,-85 35,-85 85,-35" class="outline"/>
+    <polygon points="32,0 0,32 -32,0 0,-32" class="outline"/>
+    <line x1="12" y1="-85" x2="-6" y2="-85" class="sk"/>
+    <polygon points="-14,-85 -5,-89.5 -5,-80.5" class="dot-ink"/>
+    <line x1="-12" y1="85" x2="6" y2="85" class="sk"/>
+    <polygon points="14,85 5,80.5 5,89.5" class="dot-ink"/>
+    <g transform="translate(8,-24) rotate(45)">
+      <line x1="0" y1="0" x2="12" y2="0" class="sk"/>
+      <polygon points="19,0 10,-4.5 10,4.5" class="dot-ink"/>
+    </g>
+    <text x="0" y="-100" class="mid small">outer loop</text>
+    <text x="0" y="5" class="mid small">hole</text>
+  </g>
+  <!-- (c) triangulated -->
+  <g transform="translate(630,120)">
+    <path d="M85,35 L35,85 L-35,85 L-85,35 L-85,-35 L-35,-85 L35,-85 L85,-35 Z
+             M32,0 L0,32 L-32,0 L0,-32 Z"
+          fill-rule="evenodd" fill="var(--pos)" fill-opacity=".09" stroke="none"/>
+    <line x1="85" y1="-35" x2="32" y2="0" class="thin"/>
+    <line x1="35" y1="85" x2="0" y2="32" class="thin"/>
+    <line x1="-35" y1="85" x2="0" y2="32" class="thin"/>
+    <line x1="-85" y1="35" x2="-32" y2="0" class="thin"/>
+    <line x1="-85" y1="-35" x2="-32" y2="0" class="thin"/>
+    <line x1="35" y1="-85" x2="0" y2="-32" class="thin"/>
+    <line x1="-35" y1="-85" x2="0" y2="-32" class="thin"/>
+    <line x1="85" y1="35" x2="0" y2="32" class="thin"/>
+    <line x1="-35" y1="85" x2="-32" y2="0" class="thin"/>
+    <line x1="-85" y1="-35" x2="0" y2="-32" class="thin"/>
+    <line x1="35" y1="-85" x2="32" y2="0" class="thin"/>
+    <polygon points="85,35 35,85 -35,85 -85,35 -85,-35 -35,-85 35,-85 85,-35" class="outline"/>
+    <polygon points="32,0 0,32 -32,0 0,-32" class="outline"/>
+    <line x1="32" y1="0" x2="85" y2="35" class="bridge"/>
+    <line x1="58" y1="46" x2="56" y2="24" class="leader"/>
+    <text x="58" y="62" class="mid small tplane">bridge</text>
+  </g>
+  <text x="130" y="258" class="mid">① Collect segments, weld endpoints</text>
+  <text x="380" y="258" class="mid">② Chain into closed loops</text>
+  <text x="630" y="258" class="mid">③ Bridge holes, triangulate</text>
+</svg>
+<figcaption><span class="figno">Fig. 5</span>Cap generation for a doughnut-shaped (holed)
+cross section. Chaining the loose segments yields an outer loop and a hole loop; the hole
+is connected to the outer contour with a bridge edge (purple) so the whole thing can be
+triangulated as a single polygon.</figcaption>
+</figure>
+
+<h3>① Welding endpoints and removing duplicates</h3>
+<p>
+Segments generated independently by each triangle have endpoints that differ by tiny
+floating-point errors. Coordinates are therefore quantized to a grid around 10⁻⁵ of the
+model size, and endpoints falling into the same cell are <strong>welded</strong> into one
+point. Also, an edge lying exactly on the plane is reported as the same segment by both
+of its adjacent triangles, so duplicate segments are dropped.
+</p>
+
+<h3>② Chaining into closed loops</h3>
+<p>
+After welding, the segments share endpoints, so they can be chained end-to-end into
+<strong>closed loops</strong>. The cross section of a watertight mesh cut by a plane is
+always one or more closed contours — an outer boundary, possibly with holes.
+</p>
+
+<h3>③ 2D projection and triangulation</h3>
+<p>
+Loop points are projected onto two in-plane axes (u, v) to get 2D polygons (they are also
+normalized to unit size as a numeric-robustness measure). The actual triangulation is
+handled by <code>PolygonTriangulator</code>:
+</p>
+<ul>
+  <li><strong>Outer contours vs. holes</strong> — for each loop, count how many other loops
+      contain it: an even count means a solid outer contour, an odd count means a hole
+      (the even-odd rule). This correctly handles doughnut-shaped and nested cross sections.</li>
+  <li><strong>Hole bridging</strong> — each hole loop is joined to its outer contour through
+      a <strong>bridge edge</strong> between a mutually visible pair of vertices, turning
+      the region into a single hole-free polygon (the purple edge in Fig. 5 ③; it is
+      inserted as a doubled there-and-back edge).</li>
+  <li><strong>Ear clipping</strong> — the classic method of repeatedly cutting off convex
+      corners triangulates the resulting polygon.</li>
+</ul>
+
+<h3>Adding the cap to both pieces</h3>
+<p>
+The resulting triangles are added to <strong>both pieces with the same shape</strong> but
+opposite orientations. Seen from the <span class="term-pos">Positive</span> piece, the cut
+faces away from the plane normal, so its cap uses normal −n with reversed winding; the
+<span class="term-neg">Negative</span> piece keeps normal +n and the original winding
+(see Fig. 1). Cap vertices get a tangent built from an in-plane axis and UV = (0, 0).
+</p>
+
+<!-- ================================================================ -->
+<h2><span class="no">6</span>Offsetting the Cut Plane — Avoiding Degeneracy</h2>
+
+<p>
+Everything above works as long as the plane crosses triangle edges cleanly. Things change
+when the plane passes <strong>exactly through a vertex or along an edge</strong>: the
+intersection collapses to a point, or the cut segments end up interrupted or branching,
+and the cut boundary no longer forms closed loops. With a broken boundary the
+triangulation falls apart and the cap comes out damaged — typically with
+<strong>holes in it</strong>.
+</p>
+
+<figure>
+<svg viewBox="0 0 720 250" role="img" aria-label="Degeneracy when the plane passes through a vertex, and its avoidance by offsetting">
+  <!-- left: degenerate -->
+  <g transform="translate(20,20)">
+    <line x1="0" y1="140" x2="310" y2="140" class="sp dash"/>
+    <polyline points="20,60 90,140 160,70 230,150 290,95" class="sk"/>
+    <circle cx="221" cy="140" r="3.5" class="dot-plane"/>
+    <circle cx="90" cy="140" r="3.5" class="dot-bad"/>
+    <circle cx="90" cy="140" r="8" class="ring-bad"/>
+    <line x1="86" y1="150" x2="72" y2="180" class="leader"/>
+    <text x="70" y="198" class="mid small tbad">vertex exactly on the plane</text>
+  </g>
+  <!-- right: nudged -->
+  <g transform="translate(390,20)">
+    <line x1="0" y1="140" x2="310" y2="140" class="sp dash faint"/>
+    <line x1="0" y1="120" x2="310" y2="120" class="sp dash"/>
+    <polyline points="20,60 90,140 160,70 230,150 290,95" class="sk"/>
+    <circle cx="72" cy="120" r="3.5" class="dot-plane"/>
+    <circle cx="110" cy="120" r="3.5" class="dot-plane"/>
+    <circle cx="204" cy="120" r="3.5" class="dot-plane"/>
+    <circle cx="263" cy="120" r="3.5" class="dot-plane"/>
+    <line x1="14" y1="138" x2="14" y2="126" class="sp"/>
+    <polygon points="14,118 9.5,127 18.5,127" class="fp"/>
+    <text x="24" y="130" class="small tplane">m·ε</text>
+  </g>
+  <text x="175" y="236" class="mid">Grazing a vertex degenerates the cut</text>
+  <text x="545" y="236" class="mid">A small shift makes every crossing transversal</text>
+</svg>
+<figcaption><span class="figno">Fig. 6</span>Degeneracy and its avoidance (mesh side view).
+Left: the plane (dashed) passes exactly through a mesh vertex and the intersection breaks.
+Right: shifting the plane by m·ε along its normal turns every intersection into an
+ordinary transversal crossing.</figcaption>
+</figure>
+
+<p>
+MeshSlicer therefore <strong>probes</strong> the cut position before doing the real slice.
+The probe runs only the lightweight segment-collection pass (no clipping, no mesh building)
+and inspects the welded boundary graph. The test is simple:
+<strong>every point must have degree exactly 2</strong> (i.e., exactly two segments meet
+there) — which is equivalent to the boundary being a union of simple closed loops.
+</p>
+
+<figure>
+<svg viewBox="0 0 720 262" role="img" aria-label="The boundary-graph degree check and the offset search steps">
+  <!-- degree examples -->
+  <g transform="translate(140,72)">
+    <polyline points="-52,22 -10,-14 36,6" class="sk"/>
+    <circle cx="36" cy="6" r="4.5" class="dot-bad"/>
+    <text x="52" y="-8" class="tbad">✕</text>
+    <text x="0" y="58" class="mid small">degree 1 (dangling)</text>
+  </g>
+  <g transform="translate(360,72)">
+    <polygon points="0,-30 28.5,-9.3 17.6,24.3 -17.6,24.3 -28.5,-9.3" class="outline"/>
+    <circle cx="0" cy="-30" r="3.5" class="dot-pos"/>
+    <circle cx="28.5" cy="-9.3" r="3.5" class="dot-pos"/>
+    <circle cx="17.6" cy="24.3" r="3.5" class="dot-pos"/>
+    <circle cx="-17.6" cy="24.3" r="3.5" class="dot-pos"/>
+    <circle cx="-28.5" cy="-9.3" r="3.5" class="dot-pos"/>
+    <text x="42" y="-22" class="tpos">✓</text>
+    <text x="0" y="58" class="mid small">degree 2 (closed loop)</text>
+  </g>
+  <g transform="translate(580,72)">
+    <line x1="0" y1="0" x2="-38" y2="-26" class="sk"/>
+    <line x1="0" y1="0" x2="38" y2="-26" class="sk"/>
+    <line x1="0" y1="0" x2="0" y2="34" class="sk"/>
+    <circle cx="0" cy="0" r="4.5" class="dot-bad"/>
+    <text x="52" y="-16" class="tbad">✕</text>
+    <text x="0" y="58" class="mid small">degree 3 (branch)</text>
+  </g>
+  <text x="360" y="158" class="mid">Shift the plane in steps of ε and re-probe until every boundary point has degree 2</text>
+  <!-- nudge ruler -->
+  <line x1="80" y1="205" x2="645" y2="205" class="axis"/>
+  <line x1="360" y1="196" x2="360" y2="214" class="tick0"/>
+  <line x1="378" y1="199" x2="378" y2="211" class="tick"/>
+  <line x1="342" y1="199" x2="342" y2="211" class="tick"/>
+  <line x1="391" y1="199" x2="391" y2="211" class="tick"/>
+  <line x1="329" y1="199" x2="329" y2="211" class="tick"/>
+  <line x1="411" y1="199" x2="411" y2="211" class="tick"/>
+  <line x1="309" y1="199" x2="309" y2="211" class="tick"/>
+  <line x1="448" y1="199" x2="448" y2="211" class="tick"/>
+  <line x1="272" y1="199" x2="272" y2="211" class="tick"/>
+  <line x1="513" y1="199" x2="513" y2="211" class="tick"/>
+  <line x1="207" y1="199" x2="207" y2="211" class="tick"/>
+  <line x1="624" y1="199" x2="624" y2="211" class="tick"/>
+  <line x1="96" y1="199" x2="96" y2="211" class="tick"/>
+  <!-- tick labels (two rows) -->
+  <text x="378" y="178" class="mid small mono">+ε</text>
+  <text x="342" y="178" class="mid small mono">−ε</text>
+  <text x="411" y="178" class="mid small mono">+8ε</text>
+  <text x="309" y="178" class="mid small mono">−8ε</text>
+  <text x="513" y="178" class="mid small mono">+72ε</text>
+  <text x="207" y="178" class="mid small mono">−72ε</text>
+  <text x="360" y="192" class="mid small mono">0</text>
+  <text x="391" y="192" class="mid small mono">+3ε</text>
+  <text x="329" y="192" class="mid small mono">−3ε</text>
+  <text x="448" y="192" class="mid small mono">+24ε</text>
+  <text x="272" y="192" class="mid small mono">−24ε</text>
+  <text x="624" y="192" class="mid small mono">+216ε</text>
+  <text x="96" y="192" class="mid small mono">−216ε</text>
+  <!-- try order -->
+  <text x="360" y="228" class="mid small mono">1</text>
+  <text x="378" y="228" class="mid small mono">2</text>
+  <text x="342" y="228" class="mid small mono">3</text>
+  <text x="391" y="228" class="mid small mono">4</text>
+  <text x="329" y="228" class="mid small mono">5</text>
+  <text x="411" y="228" class="mid small mono">6</text>
+  <text x="309" y="228" class="mid small mono">7</text>
+  <text x="448" y="228" class="mid small mono">8</text>
+  <text x="272" y="228" class="mid small mono">9</text>
+  <text x="513" y="228" class="mid small mono">10</text>
+  <text x="207" y="228" class="mid small mono">11</text>
+  <text x="624" y="228" class="mid small mono">12</text>
+  <text x="96" y="228" class="mid small mono">13</text>
+  <text x="360" y="250" class="mid small">Numbers below show the trial order: start at 0, then widen alternately to both sides</text>
+</svg>
+<figcaption><span class="figno">Fig. 7</span>Top: the probe's boundary-graph sanity check.
+A single point of degree 1 (dangling) or degree ≥ 3 (branching) rejects that cut position.
+Bottom: the sequence of offset candidates; the spacing grows roughly logarithmically
+(tick positions are schematic).</figcaption>
+</figure>
+
+<p>
+When the probe fails, the plane is shifted by <code>m × ε</code> along its normal and
+probed again. The candidate multipliers <code>m</code> are listed below — starting at 0
+and alternating to both sides with escalating steps:
+</p>
+
+<pre><code>// Nudge amounts (in units of ε) tried when the cut position is degenerate.
+// Escalating and two-sided.
+static readonly float[] NudgeSteps = { 0, 1, -1, 3, -3, 8, -8, 24, -24, 72, -72, 216, -216 };</code></pre>
+
+<p>
+Even the largest offset, 216ε, is only about 2% of the model size, so the change in cut
+position is practically invisible. Most cases resolve within the first step or two.
+The probe is a light O(triangle count) pass that only collects segments, so it adds very
+little cost to a normal, non-degenerate slice. And because the probe and the real slice
+share the intersection code (<code>TryCutSegment</code>), the boundary that passed the
+probe is exactly the boundary produced by the actual cut. If every candidate fails, the
+slicer falls back to a best-effort cut at the original position.
+</p>
+
+<!-- ================================================================ -->
+<h2><span class="no">7</span>Summary — Mapping to the Source</h2>
+
+<p>
+In short: MeshSlicer sorts triangles by signed distance, clips only the straddling ones,
+then assembles the cut segments into closed loops and seals them with caps. Three layers
+of defense guard against numeric error: snapping near-plane vertices to zero (ε),
+quantized welding of segment endpoints, and the offset search for the cut position itself.
+</p>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr><th>File</th><th>Role</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>Slicer.cs</code></td>
+        <td>Entry point: distance computation, offset search, triangle classification and clipping, overall assembly</td></tr>
+    <tr><td><code>Vertex.cs</code></td>
+        <td>A vertex with position / normal / tangent / UV and its linear interpolation (<code>Lerp</code>)</td></tr>
+    <tr><td><code>CapBuilder.cs</code></td>
+        <td>Collecting, welding, and chaining cut segments; 2D projection; the boundary-graph degree check</td></tr>
+    <tr><td><code>PolygonTriangulator.cs</code></td>
+        <td>Triangulation of polygons with holes (outer/hole classification, bridging, ear clipping)</td></tr>
+    <tr><td><code>MeshBuilder.cs</code></td>
+        <td>Accumulates triangles and bakes them into a <code>Mesh</code></td></tr>
+    <tr><td><code>SliceResult.cs</code></td>
+        <td>The result (the Positive / Negative mesh pair)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>
+The input is assumed to be a <strong>watertight (2-manifold) mesh</strong>. Open meshes or
+self-intersecting meshes may produce cut boundaries that do not close into loops, in which
+case the caps cannot be built correctly (the wall splitting itself still works).
+</p>
+
+<footer>
+MeshSlicer — algorithm notes for Assets/MeshSlicer/Runtime (July 2026).
+The Burst implementation (BurstSlicer.cs) is an accelerated version of the same algorithm
+and is out of scope for this document.
+</footer>
+</main>
+</html>
